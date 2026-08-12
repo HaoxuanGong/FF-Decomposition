@@ -1,0 +1,45 @@
+# This research workspace contains many unrelated scripts and generated runs.
+# Keep the initial FF-Decomposition release intentionally allowlisted.
+/*
+!/.gitattributes
+!/.gitignore
+!/README.md
+!/pyproject.toml
+!/requirements.txt
+!/VanillaMonoForward.py
+!/MFCNNBenchmark.py
+!/MLPMixerBenchmarkSuite.py
+!/medmnist_support.py
+!/FFDecompositionBenchmark.py
+!/experiments/
+!/experiments/**
+!/tests/
+/tests/*
+!/tests/test_release_entrypoints.py
+!/tests/test_ff_decomposition_benchmark.py
+
+# Python, build, and editor state inside the released directories.
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+.idea/
+.vscode/
+
+# Datasets, checkpoints, logs, and generated experiment artifacts.
+data/
+results/
+tmp*/
+lightning_logs/
+*.ckpt
+*.log
+*.pt
+*.pth
+*.csv
+*.pdf
+*.png
+*.tif
+*.tiff

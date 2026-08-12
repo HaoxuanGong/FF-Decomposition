@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ff-decomposition-experiments"
+version = "0.1.0"
+description = "Main accuracy experiments for Mono-Forward and Forward-Forward decomposition"
+requires-python = ">=3.10"
+dependencies = [
+    "medmnist>=3.0",
+    "numpy>=1.24",
+    "Pillow>=9.0",
+    "torch>=2.3",
+    "torchvision>=0.18",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff>=0.5"]
+
+[project.scripts]
+mf-mlp = "experiments.mlp:main"
+mf-cnn = "experiments.cnn:main"
+mf-mixer = "experiments.mixer:main"
+ff-decomposition = "experiments.decomposition:main"
+
+[tool.setuptools]
+packages = ["experiments"]
+py-modules = [
+    "FFDecompositionBenchmark",
+    "MFCNNBenchmark",
+    "medmnist_support",
+    "MLPMixerBenchmarkSuite",
+    "VanillaMonoForward",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100

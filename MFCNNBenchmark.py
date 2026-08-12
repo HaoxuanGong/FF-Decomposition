@@ -381,11 +381,11 @@ def train_one_epoch(
             optimizer.step()
             layer_loss_sums[index] += loss.item() * batch_size
 
-            # Refresh the representation after the local update, then sever the
-            # graph before the next block.  This is the defining MF update rule.
-            with torch.no_grad():
-                features = block(features.detach() if index else features).detach()
-                local_logits.append(head(features))
+            # Stream the activation already used by this local objective to
+            # the next block. Re-running the block after the optimizer step
+            # would update BatchNorm twice for the same minibatch.
+            features = block_output.detach()
+            local_logits.append(logits.detach())
 
         cumulative_logits = torch.stack(local_logits).sum(dim=0)
         cumulative_correct += cumulative_logits.argmax(dim=1).eq(labels).sum().item()

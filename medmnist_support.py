@@ -63,11 +63,18 @@ def medmnist_transforms(flag: str, num_channels: int):
 
 
 def build_medmnist_splits(flag: str, data_root: Path):
+    """Build the official MedMNIST train, validation, and test splits."""
+
     dataset_class, info = load_medmnist_class_and_info(flag)
+    import medmnist
+
     num_channels = int(info["n_channels"])
     train_transform, eval_transform = medmnist_transforms(flag, num_channels)
     train_set = dataset_class(
         root=str(data_root), split="train", download=True, transform=train_transform
+    )
+    validation_set = dataset_class(
+        root=str(data_root), split="val", download=True, transform=eval_transform
     )
     test_set = dataset_class(
         root=str(data_root), split="test", download=True, transform=eval_transform
@@ -82,8 +89,21 @@ def build_medmnist_splits(flag: str, data_root: Path):
         "metric_secondary_name": "auc",
         "label_map": info["label"],
         "is_medmnist": True,
+        "validation_is_official": True,
+        "dataset_source": f"MedMNIST:{flag.lower()}",
+        "dataset_version": medmnist.__version__,
+        "training_augmentation": (
+            "random_horizontal_flip+random_vertical_flip"
+            if flag.lower() == "pathmnist"
+            else (
+                "random_horizontal_flip"
+                if flag.lower() in {"dermamnist", "retinamnist"}
+                else "none"
+            )
+        ),
+        "final_evaluation_split": "official_test",
     }
-    return train_set, test_set, meta
+    return train_set, validation_set, test_set, meta
 
 
 def is_multilabel_task(task: str) -> bool:

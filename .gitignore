@@ -3,20 +3,23 @@
 /*
 !/.gitattributes
 !/.gitignore
-!/README.md
 !/pyproject.toml
 !/requirements.txt
-!/VanillaMonoForward.py
-!/MFCNNBenchmark.py
+!/decomposition_core.py
+!/MLPBenchmarkSuite.py
+!/BroadMLPBenchmarkScheduler.py
+!/MatchedLocalityControlScheduler.py
+!/MatchedCELocalityControlScheduler.py
+!/NormalizationAblationScheduler.py
+!/LocalBPCNNBenchmark.py
+!/MatchedCNNLocalBPBenchmarkScheduler.py
 !/MLPMixerBenchmarkSuite.py
+!/ReducedMixerBenchmarkScheduler.py
 !/medmnist_support.py
-!/FFDecompositionBenchmark.py
-!/experiments/
-!/experiments/**
+!/ReconstructionProbe.py
+!/ReconstructionExperimentScheduler.py
 !/tests/
-/tests/*
-!/tests/test_release_entrypoints.py
-!/tests/test_ff_decomposition_benchmark.py
+!/tests/**
 
 # Python, build, and editor state inside the released directories.
 **/__pycache__/

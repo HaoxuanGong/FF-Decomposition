@@ -888,12 +888,8 @@ def state_dict_sha256(state_dict: dict[str, torch.Tensor]) -> str:
 
 def source_sha256() -> dict[str, str]:
     project_root = Path(__file__).resolve().parent
-    names = ("LocalBPCNNBenchmark.py", "MatchedCNNLocalBPBenchmarkScheduler.py")
-    return {
-        name: file_sha256(project_root / name)
-        for name in names
-        if (project_root / name).is_file()
-    }
+    name = "LocalBPCNNBenchmark.py"
+    return {name: file_sha256(project_root / name)}
 
 
 def load_checkpoint(path: Path) -> dict[str, object]:

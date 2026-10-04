@@ -60,8 +60,7 @@ class GoodnessMLP(nn.Module):
             raise ValueError("normalization_epsilon must be positive")
         dims = (input_dim, *hidden_dims)
         self.layers = nn.ModuleList(
-            nn.Linear(dims[index], dims[index + 1])
-            for index in range(len(dims) - 1)
+            nn.Linear(dims[index], dims[index + 1]) for index in range(len(dims) - 1)
         )
         # ``normalize`` controls only normalization between hidden layers.
         # By default the first-layer policy follows it, preserving the API used
@@ -320,7 +319,9 @@ def train_pairwise_global_epoch(
     for batch in loader:
         inputs, labels = _move_batch(batch, device)
         positive = mark_inputs(inputs, labels, num_classes)
-        negative = mark_inputs(inputs, sample_wrong_labels(labels, num_classes), num_classes)
+        negative = mark_inputs(
+            inputs, sample_wrong_labels(labels, num_classes), num_classes
+        )
         loss = softplus_goodness_loss(
             model.goodness(positive, aggregation="final"),
             model.goodness(negative, aggregation="final"),
@@ -382,7 +383,9 @@ def train_matched_ff_epoch(
     for batch in loader:
         inputs, labels = _move_batch(batch, device)
         positive = mark_inputs(inputs, labels, num_classes)
-        negative = mark_inputs(inputs, sample_wrong_labels(labels, num_classes), num_classes)
+        negative = mark_inputs(
+            inputs, sample_wrong_labels(labels, num_classes), num_classes
+        )
         layer_losses = matched_ff_layer_losses(
             model,
             positive,

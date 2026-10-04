@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """Compare three cross-entropy controls on a matched four-block CNN.
 
-All methods use the same Conv--BatchNorm--ReLU--MaxPool backbone. BP applies
-one cross-entropy loss to the final classifier and propagates its gradient
-through the complete backbone. Local BP attaches a classifier to every block,
-optimizes each block and classifier with a local cross-entropy loss, and
-detaches the activation passed between blocks. CE (Global, Multi-Head) uses
-the same per-block classifiers, losses, and summed-logit prediction rule as
-Local BP, but removes the detachments and performs one global update from the
-sum of the four cross-entropy losses.
+All methods use the same Conv--BatchNorm--ReLU--MaxPool backbone. CE (Global,
+Terminal) applies one cross-entropy loss to the final classifier and propagates
+its gradient through the complete backbone. CE (Local, Multi-Head) attaches a
+classifier to every block, optimizes each block and classifier with a local
+cross-entropy loss, and detaches the activation passed between blocks. CE
+(Global, Multi-Head) uses the same per-block classifiers, losses, and
+summed-logit prediction rule, but removes the detachments and performs one
+global update from the sum of the four cross-entropy losses.
 
-For every seed, a deterministic stratified subset of the official training
-split is reserved for validation. Validation accuracy selects the checkpoint
-and controls early stopping. The selected checkpoint is restored before the
-official test split is evaluated exactly once. Transforms perform tensor
-conversion and normalization only: there is no augmentation, dropout, or
-weight decay.
+For the requested seed, a deterministic stratified subset of the official
+training split is reserved for validation. Validation accuracy selects the
+checkpoint and controls early stopping. The selected checkpoint is restored
+before the official test split is evaluated exactly once. Transforms perform
+tensor conversion and normalization only: there is no augmentation, dropout,
+or weight decay.
 """
 
 from __future__ import annotations
@@ -98,7 +98,7 @@ class RunConfig:
     step_gamma: float
     batch_size: int
     eval_batch_size: int
-    seeds: list[int]
+    seed: int
     num_workers: int
     data_dir: str
     output_dir: str
@@ -133,7 +133,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "per-block CE on the matched backbone."
         ),
     )
-    parser.add_argument("--epochs", type=int, default=200, help="Maximum number of epochs.")
+    parser.add_argument(
+        "--epochs", type=int, default=200, help="Maximum number of epochs."
+    )
     parser.add_argument(
         "--patience",
         type=int,
@@ -162,21 +164,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-batch-size", type=int, default=512)
     parser.add_argument(
-        "--seeds",
-        nargs="+",
+        "--seed",
         type=int,
-        default=[424, 425, 426],
-        help="Independent run and train/validation split seeds.",
+        required=True,
+        help="Run and train/validation split seed for this paper job.",
     )
-    parser.add_argument("--num-workers", "--workers", dest="num_workers", type=int, default=4)
+    parser.add_argument(
+        "--num-workers", "--workers", dest="num_workers", type=int, default=4
+    )
     parser.add_argument("--data-dir", default="data")
     parser.add_argument(
         "--output-dir",
         default=None,
         help="Result directory (default: cnn_<method>_<dataset>).",
     )
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--download", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--device", default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    parser.add_argument(
+        "--download", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--save-checkpoints", action="store_true")
     parser.add_argument(
         "--defer-test",
@@ -222,14 +229,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--eval-batch-size must be positive")
     if args.num_workers < 0:
         raise ValueError("--num-workers cannot be negative")
-    if not args.seeds:
-        raise ValueError("--seeds must contain at least one seed")
-    if any(seed < 0 for seed in args.seeds):
-        raise ValueError("--seeds must contain non-negative integers")
-    if len(set(args.seeds)) != len(args.seeds):
-        raise ValueError("--seeds must not contain duplicates")
+    if args.seed < 0:
+        raise ValueError("--seed must be a non-negative integer")
     if not args.provenance_run_id or any(
-        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+        character
+        not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
         for character in args.provenance_run_id
     ):
         raise ValueError(
@@ -287,7 +291,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         step_gamma=args.step_gamma,
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
-        seeds=list(args.seeds),
+        seed=args.seed,
         num_workers=args.num_workers,
         data_dir=str(Path(args.data_dir).expanduser()),
         output_dir=str(Path(output_dir).expanduser()),
@@ -297,7 +301,9 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         provenance_run_id=args.provenance_run_id,
         overwrite=args.overwrite,
         defer_test=args.defer_test,
-        heartbeat_file=str(Path(args.heartbeat_file).expanduser()) if args.heartbeat_file else "",
+        heartbeat_file=str(Path(args.heartbeat_file).expanduser())
+        if args.heartbeat_file
+        else "",
         terminal_classifier_bias=False,
         test_evaluation_policy=(
             "deferred-until-profile-selection"
@@ -314,11 +320,10 @@ def intended_output_paths(config: RunConfig) -> list[Path]:
         output_dir / "config.json",
         output_dir / "history.csv",
         output_dir / "per_seed_results.csv",
-        output_dir / "aggregate_results.csv",
         output_dir / "run_metadata.json",
     ]
     if config.save_checkpoints:
-        paths.extend(output_dir / f"seed_{seed}_best.pt" for seed in config.seeds)
+        paths.append(output_dir / f"seed_{config.seed}_best.pt")
     return paths
 
 
@@ -388,7 +393,9 @@ def stratified_split_indices(
 
     classes, counts = np.unique(targets, return_counts=True)
     if np.any(counts < 2):
-        raise ValueError("Every class needs at least two examples for a train/validation split")
+        raise ValueError(
+            "Every class needs at least two examples for a train/validation split"
+        )
     if validation_size < len(classes):
         raise ValueError(
             f"--validation-size must be at least the number of classes ({len(classes)})"
@@ -400,7 +407,10 @@ def stratified_split_indices(
     remaining = validation_size - int(quotas.sum())
     order = sorted(
         range(len(classes)),
-        key=lambda index: (-(ideal[index] - np.floor(ideal[index])), int(classes[index])),
+        key=lambda index: (
+            -(ideal[index] - np.floor(ideal[index])),
+            int(classes[index]),
+        ),
     )
     while remaining > 0:
         allocated = False
@@ -412,7 +422,9 @@ def stratified_split_indices(
                 if remaining == 0:
                     break
         if not allocated:
-            raise ValueError("Validation size leaves too few examples for the training split")
+            raise ValueError(
+                "Validation size leaves too few examples for the training split"
+            )
 
     rng = np.random.default_rng(seed)
     validation_parts = []
@@ -426,7 +438,9 @@ def stratified_split_indices(
     validation_mask[validation_indices] = True
     train_indices = np.flatnonzero(~validation_mask).astype(np.int64)
     if len(validation_indices) != validation_size:
-        raise RuntimeError("Internal error: stratified split has the wrong validation size")
+        raise RuntimeError(
+            "Internal error: stratified split has the wrong validation size"
+        )
     return train_indices.tolist(), validation_indices.tolist()
 
 
@@ -489,14 +503,21 @@ def build_loaders(
         generator=torch.Generator().manual_seed(seed + 2),
         **common,
     )
-    return train_loader, validation_loader, test_loader, split_sha256(validation_indices)
+    return (
+        train_loader,
+        validation_loader,
+        test_loader,
+        split_sha256(validation_indices),
+    )
 
 
 class ConvBlock(nn.Module):
     def __init__(self, input_channels: int, output_channels: int):
         super().__init__()
         self.layers = nn.Sequential(
-            nn.Conv2d(input_channels, output_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(
+                input_channels, output_channels, kernel_size=3, padding=1, bias=False
+            ),
             nn.BatchNorm2d(output_channels),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2),
@@ -632,7 +653,9 @@ def build_optimizers(
     config: RunConfig,
 ) -> list[torch.optim.Optimizer]:
     if isinstance(model, BPCNN):
-        return [build_optimizer(config.optimizer, model.parameters(), config.learning_rate)]
+        return [
+            build_optimizer(config.optimizer, model.parameters(), config.learning_rate)
+        ]
     if isinstance(model, LocalBPCNN):
         return [
             build_optimizer(
@@ -643,7 +666,9 @@ def build_optimizers(
             for block, head in zip(model.blocks, model.heads)
         ]
     if isinstance(model, GlobalMultiHeadCECNN):
-        return [build_optimizer(config.optimizer, model.parameters(), config.learning_rate)]
+        return [
+            build_optimizer(config.optimizer, model.parameters(), config.learning_rate)
+        ]
     raise TypeError(f"Unsupported model type: {type(model).__name__}")
 
 
@@ -670,9 +695,14 @@ def require_finite_tensor(name: str, tensor: torch.Tensor) -> None:
         raise FloatingPointError(f"Non-finite {name} detected")
 
 
-def require_finite_gradients(parameters: Iterable[torch.nn.Parameter], context: str) -> None:
+def require_finite_gradients(
+    parameters: Iterable[torch.nn.Parameter], context: str
+) -> None:
     for parameter in parameters:
-        if parameter.grad is not None and not torch.isfinite(parameter.grad).all().item():
+        if (
+            parameter.grad is not None
+            and not torch.isfinite(parameter.grad).all().item()
+        ):
             raise FloatingPointError(f"Non-finite gradient detected in {context}")
 
 
@@ -795,7 +825,9 @@ def train_global_multihead_ce_epoch(
         logits_by_head = model.forward_heads(images)
         losses = []
         for index, logits in enumerate(logits_by_head):
-            require_finite_tensor(f"Global multi-head CE layer {index + 1} logits", logits)
+            require_finite_tensor(
+                f"Global multi-head CE layer {index + 1} logits", logits
+            )
             loss = criterion(logits, labels)
             require_finite_tensor(f"Global multi-head CE layer {index + 1} loss", loss)
             losses.append(loss)
@@ -809,9 +841,9 @@ def train_global_multihead_ce_epoch(
         require_finite_gradients(model.parameters(), "Global multi-head CE")
         optimizer.step()
 
-        prediction_logits = torch.stack([logits.detach() for logits in logits_by_head]).sum(
-            dim=0
-        )
+        prediction_logits = torch.stack(
+            [logits.detach() for logits in logits_by_head]
+        ).sum(dim=0)
         correct += prediction_logits.argmax(dim=1).eq(labels).sum().item()
 
     if total_samples == 0:
@@ -860,7 +892,10 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> floa
 
 
 def state_dict_on_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
-    return {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+    return {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in model.state_dict().items()
+    }
 
 
 def file_sha256(path: Path) -> str:
@@ -888,7 +923,7 @@ def state_dict_sha256(state_dict: dict[str, torch.Tensor]) -> str:
 
 def source_sha256() -> dict[str, str]:
     project_root = Path(__file__).resolve().parent
-    name = "LocalBPCNNBenchmark.py"
+    name = "cnn_experiment.py"
     return {name: file_sha256(project_root / name)}
 
 
@@ -913,7 +948,9 @@ def runtime_environment(device: torch.device) -> dict[str, object]:
     """Capture enough software and hardware detail to audit a remote run."""
     gpu: dict[str, object] | None = None
     if device.type == "cuda":
-        index = device.index if device.index is not None else torch.cuda.current_device()
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
         properties = torch.cuda.get_device_properties(index)
         gpu = {
             "index": index,
@@ -935,7 +972,9 @@ def runtime_environment(device: torch.device) -> dict[str, object]:
     }
 
 
-def write_csv(path: Path, fieldnames: Iterable[str], rows: list[dict[str, object]]) -> None:
+def write_csv(
+    path: Path, fieldnames: Iterable[str], rows: list[dict[str, object]]
+) -> None:
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -980,11 +1019,15 @@ def run_seed(
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         start = time.perf_counter()
-        train_metrics = train_one_epoch(model, train_loader, criterion, optimizers, device)
+        train_metrics = train_one_epoch(
+            model, train_loader, criterion, optimizers, device
+        )
         train_seconds = time.perf_counter() - start
         epoch_peak = measure_training_peak(device)
         if epoch_peak is not None:
-            peak_training_memory_bytes = max(peak_training_memory_bytes or 0, epoch_peak)
+            peak_training_memory_bytes = max(
+                peak_training_memory_bytes or 0, epoch_peak
+            )
 
         validation_accuracy = evaluate(model, validation_loader, device)
         if not math.isfinite(validation_accuracy):
@@ -1100,14 +1143,18 @@ def run_seed(
         if persisted.get("model_state_sha256") != best_state_sha256:
             raise RuntimeError("Persisted checkpoint state-hash marker is inconsistent")
         if state_dict_sha256(persisted_state) != best_state_sha256:
-            raise RuntimeError("Persisted checkpoint tensor state failed hash verification")
+            raise RuntimeError(
+                "Persisted checkpoint tensor state failed hash verification"
+            )
         model.load_state_dict(persisted_state)
     else:
         model.load_state_dict(best_state)
     restored_state_sha256 = state_dict_sha256(state_dict_on_cpu(model))
     best_checkpoint_restored = restored_state_sha256 == best_state_sha256
     if not best_checkpoint_restored:
-        raise RuntimeError("Restored model state does not match the selected checkpoint")
+        raise RuntimeError(
+            "Restored model state does not match the selected checkpoint"
+        )
 
     test_evaluations = 0
     test_accuracy: float | None = None
@@ -1116,7 +1163,9 @@ def run_seed(
         test_accuracy = evaluate(model, test_loader, device)
         test_evaluations += 1
         if test_evaluations != 1 or not math.isfinite(test_accuracy):
-            raise RuntimeError("The official test split must produce one finite evaluation")
+            raise RuntimeError(
+                "The official test split must produce one finite evaluation"
+            )
     peak_mib = (
         peak_training_memory_bytes / (1024**2)
         if peak_training_memory_bytes is not None
@@ -1191,70 +1240,6 @@ def run_seed(
     return history, summary
 
 
-def mean_and_sample_std(
-    rows: list[dict[str, object]],
-    field: str,
-) -> tuple[float | None, float | None]:
-    values = [float(row[field]) for row in rows if row[field] not in (None, "")]
-    if not values:
-        return None, None
-    return statistics.mean(values), statistics.stdev(values) if len(values) > 1 else 0.0
-
-
-def aggregate_results(seed_rows: list[dict[str, object]]) -> dict[str, object]:
-    if not seed_rows:
-        raise ValueError("At least one seed result is required")
-    validation_mean, validation_std = mean_and_sample_std(
-        seed_rows, "best_validation_accuracy"
-    )
-    test_mean, test_std = mean_and_sample_std(seed_rows, "test_accuracy")
-    epoch_mean, epoch_std = mean_and_sample_std(seed_rows, "best_epoch")
-    memory_mean, memory_std = mean_and_sample_std(
-        seed_rows, "peak_gpu_training_memory_mib"
-    )
-    time_mean, time_std = mean_and_sample_std(seed_rows, "mean_train_epoch_seconds")
-    first = seed_rows[0]
-    return {
-        "method": first["method"],
-        "dataset": first["dataset"],
-        "optimizer": first["optimizer"],
-        "optimizer_parameters": first["optimizer_parameters"],
-        "learning_rate": first["learning_rate"],
-        "scheduler": first["scheduler"],
-        "scheduler_parameters": first["scheduler_parameters"],
-        "batch_size": first["batch_size"],
-        "eval_batch_size": first["eval_batch_size"],
-        "validation_size": first["validation_size"],
-        "validation_split": first["validation_split"],
-        "maximum_epochs": first["maximum_epochs"],
-        "patience": first["patience"],
-        "minimum_delta": first["minimum_delta"],
-        "num_seeds": len(seed_rows),
-        "best_validation_accuracy_mean": validation_mean,
-        "best_validation_accuracy_sample_std": validation_std,
-        "test_accuracy_mean": test_mean,
-        "test_accuracy_sample_std": test_std,
-        "best_epoch_mean": epoch_mean,
-        "best_epoch_sample_std": epoch_std,
-        "peak_gpu_training_memory_mib_mean": memory_mean,
-        "peak_gpu_training_memory_mib_sample_std": memory_std,
-        "train_epoch_seconds_mean": time_mean,
-        "train_epoch_seconds_sample_std": time_std,
-        "test_evaluations_per_seed": int(first["test_evaluations"]),
-        "test_evaluation_policy": first["test_evaluation_policy"],
-        "all_best_checkpoints_restored": all(
-            bool(row["best_checkpoint_restored"]) for row in seed_rows
-        ),
-        "augmentation": first["augmentation"],
-        "dropout": first["dropout"],
-        "weight_decay": first["weight_decay"],
-        "precision": first["precision"],
-        "terminal_classifier_bias": first["terminal_classifier_bias"],
-        "backbone_widths": first["backbone_widths"],
-        "all_finite": all(bool(row["finite"]) for row in seed_rows),
-    }
-
-
 HISTORY_FIELDS = [
     "method",
     "dataset",
@@ -1325,44 +1310,6 @@ SEED_RESULT_FIELDS = [
     "seed_wall_seconds",
 ]
 
-AGGREGATE_FIELDS = [
-    "method",
-    "dataset",
-    "optimizer",
-    "optimizer_parameters",
-    "learning_rate",
-    "scheduler",
-    "scheduler_parameters",
-    "batch_size",
-    "eval_batch_size",
-    "validation_size",
-    "validation_split",
-    "maximum_epochs",
-    "patience",
-    "minimum_delta",
-    "num_seeds",
-    "best_validation_accuracy_mean",
-    "best_validation_accuracy_sample_std",
-    "test_accuracy_mean",
-    "test_accuracy_sample_std",
-    "best_epoch_mean",
-    "best_epoch_sample_std",
-    "peak_gpu_training_memory_mib_mean",
-    "peak_gpu_training_memory_mib_sample_std",
-    "train_epoch_seconds_mean",
-    "train_epoch_seconds_sample_std",
-    "test_evaluations_per_seed",
-    "test_evaluation_policy",
-    "all_best_checkpoints_restored",
-    "augmentation",
-    "dropout",
-    "weight_decay",
-    "precision",
-    "terminal_classifier_bias",
-    "backbone_widths",
-    "all_finite",
-]
-
 
 def main(argv: list[str] | None = None) -> None:
     run_started_at_utc = datetime.now(timezone.utc).isoformat()
@@ -1394,26 +1341,22 @@ def main(argv: list[str] | None = None) -> None:
 
     print("Run configuration:")
     print(json.dumps(asdict(config), indent=2))
-    all_history: list[dict[str, object]] = []
-    seed_results: list[dict[str, object]] = []
-    for seed in config.seeds:
-        set_seed(seed)
-        train_loader, validation_loader, test_loader, split_hash = build_loaders(config, seed)
-        history, seed_result = run_seed(
-            seed,
-            split_hash,
-            config,
-            train_loader,
-            validation_loader,
-            test_loader,
-        )
-        all_history.extend(history)
-        seed_results.append(seed_result)
-        write_csv(output_dir / "history.csv", HISTORY_FIELDS, all_history)
-        write_csv(output_dir / "per_seed_results.csv", SEED_RESULT_FIELDS, seed_results)
+    seed = config.seed
+    set_seed(seed)
+    train_loader, validation_loader, test_loader, split_hash = build_loaders(
+        config, seed
+    )
+    history, result = run_seed(
+        seed,
+        split_hash,
+        config,
+        train_loader,
+        validation_loader,
+        test_loader,
+    )
+    write_csv(output_dir / "history.csv", HISTORY_FIELDS, history)
+    write_csv(output_dir / "per_seed_results.csv", SEED_RESULT_FIELDS, [result])
 
-    aggregate = aggregate_results(seed_results)
-    write_csv(output_dir / "aggregate_results.csv", AGGREGATE_FIELDS, [aggregate])
     write_json(
         output_dir / "run_metadata.json",
         {
@@ -1427,48 +1370,31 @@ def main(argv: list[str] | None = None) -> None:
             "source_sha256": source_hashes,
             "provenance_run_id": config.provenance_run_id,
             "process_instance_id": process_instance_id,
-            "split_sha256_by_seed": {
-                str(row["seed"]): row["split_sha256"] for row in seed_results
-            },
-            "checkpoint_sha256_by_seed": {
-                str(row["seed"]): row["checkpoint_sha256"] for row in seed_results
-            },
-            "model_state_sha256_by_seed": {
-                str(row["seed"]): row["model_state_sha256"] for row in seed_results
-            },
-            "test_evaluations_total": sum(
-                int(row["test_evaluations"]) for row in seed_results
-            ),
+            "split_sha256": result["split_sha256"],
+            "checkpoint_sha256": result["checkpoint_sha256"],
+            "model_state_sha256": result["model_state_sha256"],
+            "test_evaluations_total": int(result["test_evaluations"]),
             "nonfinite_values_detected": False,
-            "best_checkpoints_restored": all(
-                bool(row["best_checkpoint_restored"]) for row in seed_results
-            ),
+            "best_checkpoint_restored": bool(result["best_checkpoint_restored"]),
         },
     )
-    print("Aggregate result (mean ± sample standard deviation):")
+    print("Job result:")
     print(
-        "Validation accuracy: "
-        f"{float(aggregate['best_validation_accuracy_mean']) * 100:.2f}% ± "
-        f"{float(aggregate['best_validation_accuracy_sample_std']) * 100:.2f}%"
+        f"Validation accuracy: {float(result['best_validation_accuracy']) * 100:.2f}%"
     )
-    if aggregate["test_accuracy_mean"] is None:
+    if result["test_accuracy"] is None:
         print("Test accuracy: deferred until optimizer-profile selection")
     else:
-        print(
-            "Test accuracy: "
-            f"{float(aggregate['test_accuracy_mean']) * 100:.2f}% ± "
-            f"{float(aggregate['test_accuracy_sample_std']) * 100:.2f}%"
-        )
-    memory_mean = aggregate["peak_gpu_training_memory_mib_mean"]
-    memory_std = aggregate["peak_gpu_training_memory_mib_sample_std"]
-    if memory_mean is not None and memory_std is not None:
-        print(f"Peak GPU training memory: {float(memory_mean):.1f} ± {float(memory_std):.1f} MiB")
+        print(f"Test accuracy: {float(result['test_accuracy']) * 100:.2f}%")
+    peak_memory = result["peak_gpu_training_memory_mib"]
+    if peak_memory is not None:
+        print(f"Peak GPU training memory: {float(peak_memory):.1f} MiB")
     else:
         print("Peak GPU training memory: not available for a non-CUDA run")
     print(
         "Official test evaluations: deferred"
         if config.defer_test
-        else "Official test evaluations: exactly one per seed"
+        else "Official test evaluations: exactly one"
     )
     print(f"Results written to {output_dir.resolve()}")
 

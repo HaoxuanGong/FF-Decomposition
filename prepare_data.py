@@ -37,7 +37,9 @@ def canonical_dataset_name(name: str) -> str:
         return aliases[normalized]
     except KeyError as exc:
         supported = ", ".join(DEFAULT_DATASETS)
-        raise ValueError(f"Unsupported dataset {name!r}. Choose from: {supported}.") from exc
+        raise ValueError(
+            f"Unsupported dataset {name!r}. Choose from: {supported}."
+        ) from exc
 
 
 def normalize_dataset_selection(dataset_names: Sequence[str]) -> list[str]:
@@ -60,7 +62,8 @@ def load_torchvision_registry() -> tuple[Mapping[str, DatasetFactory], str]:
     from torchvision import datasets
 
     registry = {
-        name: getattr(datasets, class_name) for name, class_name in DATASET_CLASS_NAMES.items()
+        name: getattr(datasets, class_name)
+        for name, class_name in DATASET_CLASS_NAMES.items()
     }
     return registry, torchvision.__version__
 
@@ -69,7 +72,9 @@ def _sample_count(dataset: Any, *, dataset_name: str, split: str) -> int:
     try:
         count = int(len(dataset))
     except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"Could not verify {dataset_name} {split} split length.") from exc
+        raise RuntimeError(
+            f"Could not verify {dataset_name} {split} split length."
+        ) from exc
     if count <= 0:
         raise RuntimeError(f"Downloaded {dataset_name} {split} split is empty.")
     return count
@@ -129,8 +134,12 @@ def bootstrap_datasets(
             {
                 "name": name,
                 "torchvision_class": DATASET_CLASS_NAMES[name],
-                "train_samples": _sample_count(train_set, dataset_name=name, split="train"),
-                "test_samples": _sample_count(test_set, dataset_name=name, split="test"),
+                "train_samples": _sample_count(
+                    train_set, dataset_name=name, split="train"
+                ),
+                "test_samples": _sample_count(
+                    test_set, dataset_name=name, split="test"
+                ),
             }
         )
 

@@ -5,15 +5,15 @@ This scheduler searches only the goodness threshold.  Every candidate uses the
 fixed constant-Adam training profile and defers the official test split.  The
 selected threshold for each dataset/method is determined from the mean best
 validation accuracy across seeds 424--426, then written as a plain JSON mapping
-accepted by ``MLPOptimizerSweepScheduler.py --thresholds-json``.
+accepted by ``mlp_optimizer_sweep.py --thresholds-json``.
 
 Typical use on a prepared GPU host::
 
-    python MLPThresholdSweepScheduler.py plan --run-dir /path/to/run
-    nohup python MLPThresholdSweepScheduler.py launch --run-dir /path/to/run \
+    python mlp_threshold_sweep.py plan --run-dir /path/to/run
+    nohup python mlp_threshold_sweep.py launch --run-dir /path/to/run \
         > /path/to/run/launcher.log 2>&1 &
-    python MLPThresholdSweepScheduler.py status --run-dir /path/to/run
-    python MLPThresholdSweepScheduler.py select --run-dir /path/to/run
+    python mlp_threshold_sweep.py status --run-dir /path/to/run
+    python mlp_threshold_sweep.py select --run-dir /path/to/run
 
 Planning never starts training or downloads datasets.  Candidate commands use
 ``--no-download --defer-test`` so this preliminary study cannot inspect test
@@ -40,12 +40,12 @@ import uuid
 
 import torch
 
-import MLPBenchmarkSuite as suite
+import mlp_experiment as suite
+from mlp_experiment import ARCHITECTURES, DATASETS
 
 
 SCHEMA_VERSION = 1
 SEEDS = (424, 425, 426)
-DATASETS = ("mnist", "fashionmnist", "cifar10", "cifar100")
 METHODS = ("ff", "ff-matched-ge", "ff-ge", "nn-ff-ge")
 METHOD_LABELS = {
     "ff": "Vanilla FF (Local, Multi-Head)",
@@ -57,12 +57,6 @@ THRESHOLDS = (1.0, 2.0, 4.0)
 # Exact ties prefer the smaller threshold.  The order is recorded in every
 # manifest and selection artifact so reruns cannot silently change this rule.
 THRESHOLD_TIE_BREAK = THRESHOLDS
-ARCHITECTURES = {
-    "mnist": (1000, 1000),
-    "fashionmnist": (1000, 1000),
-    "cifar10": (2000, 2000, 2000),
-    "cifar100": (2000, 2000, 2000),
-}
 MAXIMUM_EPOCHS = 200
 PATIENCE = 15
 MINIMUM_EPOCHS = 0
@@ -74,9 +68,9 @@ NUM_WORKERS = 4
 DEADLINE_BUFFER = timedelta(minutes=20)
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 SOURCE_FILES = (
-    "decomposition_core.py",
-    "MLPBenchmarkSuite.py",
-    "MLPThresholdSweepScheduler.py",
+    "mlp_components.py",
+    "mlp_experiment.py",
+    "mlp_threshold_sweep.py",
 )
 
 
@@ -90,7 +84,9 @@ def utc_now() -> str:
 def atomic_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     os.replace(temporary, path)
 
 
@@ -115,19 +111,23 @@ def file_sha256(path: Path) -> str:
 
 
 def object_sha256(payload: Any) -> str:
-    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode(
-        "utf-8"
-    )
+    encoded = json.dumps(
+        payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
 def signed_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    unsigned = {key: value for key, value in payload.items() if key != "integrity_sha256"}
+    unsigned = {
+        key: value for key, value in payload.items() if key != "integrity_sha256"
+    }
     return {**unsigned, "integrity_sha256": object_sha256(unsigned)}
 
 
 def verify_signature(payload: Mapping[str, Any], *, context: str) -> None:
-    unsigned = {key: value for key, value in payload.items() if key != "integrity_sha256"}
+    unsigned = {
+        key: value for key, value in payload.items() if key != "integrity_sha256"
+    }
     if payload.get("integrity_sha256") != object_sha256(unsigned):
         raise RuntimeError(f"Integrity checksum mismatch: {context}")
 
@@ -151,7 +151,11 @@ def normalize_datasets(datasets: Sequence[str] | None = None) -> tuple[str, ...]
 
 
 def identities(datasets: Sequence[str] | None = None) -> list[tuple[str, str]]:
-    return [(dataset, method) for dataset in normalize_datasets(datasets) for method in METHODS]
+    return [
+        (dataset, method)
+        for dataset in normalize_datasets(datasets)
+        for method in METHODS
+    ]
 
 
 def jobs(datasets: Sequence[str] | None = None) -> list[Job]:
@@ -167,12 +171,16 @@ def validate_runner_contract() -> None:
     observed = set(getattr(suite, "THRESHOLDED_FF_METHODS", set()))
     missing = set(METHODS) - observed
     if missing:
-        raise RuntimeError(f"MLPBenchmarkSuite lacks thresholded paper methods: {sorted(missing)}")
+        raise RuntimeError(
+            f"mlp_experiment lacks thresholded paper methods: {sorted(missing)}"
+        )
     for dataset, expected in ARCHITECTURES.items():
-        observed_architecture = tuple(getattr(suite, "ARCHITECTURES", {}).get(dataset, ()))
+        observed_architecture = tuple(
+            getattr(suite, "ARCHITECTURES", {}).get(dataset, ())
+        )
         if observed_architecture != expected:
             raise RuntimeError(
-                f"MLPBenchmarkSuite architecture mismatch for {dataset}: "
+                f"mlp_experiment architecture mismatch for {dataset}: "
                 f"{observed_architecture!r} != {expected!r}"
             )
 
@@ -191,15 +199,26 @@ def verify_source_hashes(project_root: Path, expected: Mapping[str, str]) -> Non
     observed = source_hashes(project_root)
     if observed != dict(expected):
         changed = sorted(
-            name for name in set(observed) | set(expected) if observed.get(name) != expected.get(name)
+            name
+            for name in set(observed) | set(expected)
+            if observed.get(name) != expected.get(name)
         )
-        raise RuntimeError(f"Source changed after planning the threshold sweep: {changed}")
+        raise RuntimeError(
+            f"Source changed after planning the threshold sweep: {changed}"
+        )
 
 
 def result_directory(
     run_dir: Path, threshold: float, dataset: str, method: str, seed: int
 ) -> Path:
-    return run_dir / "results" / threshold_slug(threshold) / dataset / method / f"seed_{seed}"
+    return (
+        run_dir
+        / "results"
+        / threshold_slug(threshold)
+        / dataset
+        / method
+        / f"seed_{seed}"
+    )
 
 
 def command_for(
@@ -214,10 +233,12 @@ def command_for(
     if threshold not in THRESHOLDS:
         raise ValueError(f"Unsupported threshold: {threshold}")
     if dataset not in DATASETS or method not in METHODS or seed not in SEEDS:
-        raise ValueError(f"Job is outside the paper matrix: {(threshold, dataset, method, seed)}")
+        raise ValueError(
+            f"Job is outside the paper matrix: {(threshold, dataset, method, seed)}"
+        )
     return [
         python_executable,
-        str(project_root / "MLPBenchmarkSuite.py"),
+        str(project_root / "mlp_experiment.py"),
         "run",
         "--dataset",
         dataset,
@@ -324,7 +345,9 @@ def build_manifest(
             "thresholds": list(THRESHOLDS),
             "threshold_tie_break_order": list(THRESHOLD_TIE_BREAK),
             "seeds": list(SEEDS),
-            "architectures": {dataset: list(ARCHITECTURES[dataset]) for dataset in selected},
+            "architectures": {
+                dataset: list(ARCHITECTURES[dataset]) for dataset in selected
+            },
             "optimizer": "adam",
             "learning_rate": 1e-3,
             "scheduler": "none",
@@ -356,18 +379,26 @@ def manifest_path(run_dir: Path) -> Path:
     return run_dir / "manifest.json"
 
 
-def write_or_resume_manifest(run_dir: Path, candidate: dict[str, Any]) -> dict[str, Any]:
+def write_or_resume_manifest(
+    run_dir: Path, candidate: dict[str, Any]
+) -> dict[str, Any]:
     path = manifest_path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     if path.exists():
         existing = json.loads(path.read_text(encoding="utf-8"))
         verify_signature(existing, context=str(path))
         if existing.get("spec_sha256") != candidate.get("spec_sha256"):
-            raise RuntimeError(f"Existing run manifest has a different protocol: {path}")
+            raise RuntimeError(
+                f"Existing run manifest has a different protocol: {path}"
+            )
         return existing
-    unexpected = [entry for entry in run_dir.iterdir() if entry.name != "scheduler.lock"]
+    unexpected = [
+        entry for entry in run_dir.iterdir() if entry.name != "scheduler.lock"
+    ]
     if unexpected:
-        raise RuntimeError(f"Refusing non-empty run directory without a manifest: {run_dir}")
+        raise RuntimeError(
+            f"Refusing non-empty run directory without a manifest: {run_dir}"
+        )
     atomic_json(path, candidate)
     return candidate
 
@@ -417,7 +448,9 @@ def expected_config_from_manifest(
 def verify_training_run(
     manifest: Mapping[str, Any], threshold: float, dataset: str, method: str, seed: int
 ) -> dict[str, Any]:
-    directory = result_directory(Path(manifest["run_dir"]), threshold, dataset, method, seed)
+    directory = result_directory(
+        Path(manifest["run_dir"]), threshold, dataset, method, seed
+    )
     run_path = directory / "run.json"
     config_path = directory / "config.json"
     history_path = directory / "history.csv"
@@ -427,7 +460,9 @@ def verify_training_run(
     if payload.get("schema_version") != 2:
         raise RuntimeError(f"Unexpected run schema: {run_path}")
     if payload.get("status") != "train_complete":
-        raise RuntimeError(f"Candidate is not an untouched deferred-test run: {run_path}")
+        raise RuntimeError(
+            f"Candidate is not an untouched deferred-test run: {run_path}"
+        )
     if payload.get("test") is not None or int(payload.get("test_evaluations", -1)) != 0:
         raise RuntimeError(f"Candidate test data must be absent: {run_path}")
     if payload.get("config") != expected:
@@ -507,7 +542,11 @@ def freeze_selection(
         method_summaries: list[dict[str, Any]] = []
         for preference, threshold in enumerate(THRESHOLD_TIE_BREAK):
             values = [
-                float(records[(threshold, dataset, method, seed)]["best_validation_accuracy"])
+                float(
+                    records[(threshold, dataset, method, seed)][
+                        "best_validation_accuracy"
+                    ]
+                )
                 for seed in SEEDS
             ]
             summary = {
@@ -528,13 +567,17 @@ def freeze_selection(
                     for seed in SEEDS
                 ],
                 "checkpoint_sha256": [
-                    str(records[(threshold, dataset, method, seed)]["checkpoint_sha256"])
+                    str(
+                        records[(threshold, dataset, method, seed)]["checkpoint_sha256"]
+                    )
                     for seed in SEEDS
                 ],
             }
             method_summaries.append(summary)
             summaries.append(summary)
-            candidate_scores.append((summary["mean_best_validation_accuracy"], -preference, threshold))
+            candidate_scores.append(
+                (summary["mean_best_validation_accuracy"], -preference, threshold)
+            )
         _score, _preference, selected_threshold = max(candidate_scores)
         selected[dataset][method] = float(selected_threshold)
         choices.append(
@@ -546,7 +589,9 @@ def freeze_selection(
                 "selection_metric": "mean_best_validation_accuracy",
                 "test_metrics_used_for_selection": False,
                 "candidate_mean_best_validation_accuracy": {
-                    format(item["threshold"], "g"): item["mean_best_validation_accuracy"]
+                    format(item["threshold"], "g"): item[
+                        "mean_best_validation_accuracy"
+                    ]
                     for item in method_summaries
                 },
                 "selected_runs": [
@@ -627,8 +672,13 @@ def write_or_verify_selection(
     run_dir = Path(manifest["run_dir"])
     plain_path, evidence_path, csv_path = selection_paths(run_dir)
     if evidence_path.exists():
-        if not plain_path.is_file() or json.loads(plain_path.read_text(encoding="utf-8")) != selected:
-            raise RuntimeError("Plain selected-threshold mapping is missing or inconsistent")
+        if (
+            not plain_path.is_file()
+            or json.loads(plain_path.read_text(encoding="utf-8")) != selected
+        ):
+            raise RuntimeError(
+                "Plain selected-threshold mapping is missing or inconsistent"
+            )
         if not csv_path.is_file():
             raise RuntimeError("Threshold selection CSV is missing")
         expected_plain_sha256 = file_sha256(plain_path)
@@ -638,10 +688,16 @@ def write_or_verify_selection(
         existing = json.loads(evidence_path.read_text(encoding="utf-8"))
         verify_signature(existing, context=str(evidence_path))
         ignored = {"created_at_utc", "integrity_sha256"}
-        existing_substantive = {key: value for key, value in existing.items() if key not in ignored}
-        candidate_substantive = {key: value for key, value in evidence.items() if key not in ignored}
+        existing_substantive = {
+            key: value for key, value in existing.items() if key not in ignored
+        }
+        candidate_substantive = {
+            key: value for key, value in evidence.items() if key not in ignored
+        }
         if existing_substantive != candidate_substantive:
-            raise RuntimeError("Frozen threshold selection no longer matches candidate artifacts")
+            raise RuntimeError(
+                "Frozen threshold selection no longer matches candidate artifacts"
+            )
         return
     if plain_path.exists() or csv_path.exists():
         raise RuntimeError("Incomplete threshold selection artifacts already exist")
@@ -664,7 +720,9 @@ def parse_utc(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def deadline_allows_start(stop_before_utc: datetime | None, *, now: datetime | None = None) -> bool:
+def deadline_allows_start(
+    stop_before_utc: datetime | None, *, now: datetime | None = None
+) -> bool:
     if stop_before_utc is None:
         return True
     current = now or datetime.now(timezone.utc)
@@ -753,7 +811,11 @@ def status_snapshot(manifest: Mapping[str, Any]) -> dict[str, Any]:
         directory = result_directory(run_dir, threshold, dataset, method, seed)
         path = directory / "run.json"
         if not path.exists():
-            counts["partial" if directory.exists() and any(directory.iterdir()) else "planned"] += 1
+            counts[
+                "partial"
+                if directory.exists() and any(directory.iterdir())
+                else "planned"
+            ] += 1
             continue
         try:
             verify_training_run(manifest, threshold, dataset, method, seed)
@@ -764,7 +826,9 @@ def status_snapshot(manifest: Mapping[str, Any]) -> dict[str, Any]:
     plain_path, evidence_path, csv_path = selection_paths(run_dir)
     status_payload = None
     if (run_dir / "status.json").is_file():
-        status_payload = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+        status_payload = json.loads(
+            (run_dir / "status.json").read_text(encoding="utf-8")
+        )
     return {
         "run_dir": str(run_dir),
         "candidate_runs": counts,
@@ -854,9 +918,7 @@ def launch_command(args: argparse.Namespace) -> int:
             )
             (run_dir / "scheduler.running.json").unlink(missing_ok=True)
             return 0
-        slug = (
-            f"{threshold_slug(job[0])}_{job[1]}_{job[2]}_seed{job[3]}"
-        )
+        slug = f"{threshold_slug(job[0])}_{job[1]}_{job[2]}_seed{job[3]}"
         archived = archive_partial(directory, run_dir, slug)
         state = {
             "state": "running",
@@ -943,7 +1005,13 @@ def launch_command(args: argparse.Namespace) -> int:
 
 
 def status_command(args: argparse.Namespace) -> int:
-    print(json.dumps(status_snapshot(load_manifest(args.run_dir.resolve())), indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            status_snapshot(load_manifest(args.run_dir.resolve())),
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -975,12 +1043,16 @@ def parser() -> argparse.ArgumentParser:
 
     plan = commands.add_parser("plan", help="freeze the threshold candidate manifest")
     plan.add_argument("--run-dir", type=Path, required=True)
-    plan.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent)
+    plan.add_argument(
+        "--project-root", type=Path, default=Path(__file__).resolve().parent
+    )
     plan.add_argument("--python", default=sys.executable)
     plan.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
     plan.set_defaults(function=plan_command, mutates=True)
 
-    launch = commands.add_parser("launch", help="train or resume validation-only candidates")
+    launch = commands.add_parser(
+        "launch", help="train or resume validation-only candidates"
+    )
     launch.add_argument("--run-dir", type=Path, required=True)
     launch.add_argument(
         "--stop-before-utc",
@@ -1001,7 +1073,8 @@ def parser() -> argparse.ArgumentParser:
     status.set_defaults(function=status_command, mutates=False)
 
     select = commands.add_parser(
-        "select", help="select thresholds using validation and write optimizer-sweep input"
+        "select",
+        help="select thresholds using validation and write optimizer-sweep input",
     )
     select.add_argument("--run-dir", type=Path, required=True)
     select.set_defaults(function=select_command, mutates=True)

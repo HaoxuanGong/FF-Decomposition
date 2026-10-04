@@ -17,7 +17,7 @@ import subprocess
 import sys
 from typing import Any
 
-from MLPMixerBenchmarkSuite import (
+from mixer_experiment import (
     RESULT_SCHEMA_VERSION,
     ensure_tiny,
     source_sha256,
@@ -29,6 +29,11 @@ from MLPMixerBenchmarkSuite import (
 DATASETS = ("cifar10", "cifar100", "pathmnist", "tinyimagenet")
 MANIFEST_SCHEMA_VERSION = 2
 METHODS = ("bp", "local-bp", "ce-matched-ge")
+METHOD_LABELS = {
+    "bp": "CE (Global, Terminal)",
+    "local-bp": "CE (Local, Multi-Head)",
+    "ce-matched-ge": "CE (Global, Multi-Head)",
+}
 SEEDS = (424, 425, 426)
 PATCH_SIZES = {"cifar10": 4, "cifar100": 4, "pathmnist": 7, "tinyimagenet": 8}
 PAIR_MATCH_FIELDS = (
@@ -125,53 +130,27 @@ def command_for(
     output_dir = job_dir(run_dir, dataset, method, seed)
     command = [
         python_executable,
-        str(project_root / "MLPMixerBenchmarkSuite.py"),
-        "--datasets",
+        str(project_root / "mixer_experiment.py"),
+        "--dataset",
         dataset,
-        "--methods",
+        "--method",
         method,
-        "--depths",
-        "5",
-        "--dims",
-        "256",
         "--seed",
         str(seed),
         "--epochs",
         "200",
         "--early-stop-patience",
         "15",
-        "--early-stop-min-delta",
-        "0",
-        "--validation-fraction",
-        "0.1",
         "--batch-size",
         "128",
         "--eval-batch-size",
         "256",
         "--num-workers",
         "4",
-        "--optimizer",
-        "adamw",
-        "--lr",
-        "0.0003",
-        "--weight-decay",
-        "0.05",
-        "--momentum",
-        "0.9",
-        "--token-dim",
-        "256",
-        "--channel-dim",
-        "1024",
-        "--local-bp-updates-per-block",
-        "1",
         "--data-dir",
         str(project_root / "data"),
         "--output-dir",
         str(output_dir),
-        "--results-csv",
-        "result.csv",
-        "--summary-csv",
-        "summary.csv",
         "--heartbeat-file",
         str(output_dir / "heartbeat.json"),
         "--checkpoint-dir",
@@ -184,7 +163,9 @@ def command_for(
     return command
 
 
-def _single_result_row(run_dir: Path, dataset: str, method: str, seed: int) -> dict[str, str]:
+def _single_result_row(
+    run_dir: Path, dataset: str, method: str, seed: int
+) -> dict[str, str]:
     result_path = job_dir(run_dir, dataset, method, seed) / "result.csv"
     with result_path.open("r", newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -340,9 +321,7 @@ def validate_result(row: dict[str, str], dataset: str, method: str, seed: int) -
         "num_workers": 4,
     }
     if signature != expected_signature:
-        raise RuntimeError(
-            f"Run-signature mismatch for {dataset}/{method}/seed{seed}"
-        )
+        raise RuntimeError(f"Run-signature mismatch for {dataset}/{method}/seed{seed}")
 
 
 def _mean_std(values: list[float]) -> tuple[float, float]:
@@ -366,6 +345,7 @@ def aggregate(run_dir: Path) -> dict[str, Any]:
             summary_row: dict[str, Any] = {
                 "dataset": dataset,
                 "method": method,
+                "method_label": METHOD_LABELS[method],
                 "seeds": ",".join(map(str, SEEDS)),
                 "num_runs": len(group),
                 "metric_primary_name": group[0]["metric_primary_name"],
@@ -424,7 +404,9 @@ def aggregate(run_dir: Path) -> dict[str, Any]:
                 {
                     "dataset": dataset,
                     "comparison_method": comparison_method,
+                    "comparison_method_label": METHOD_LABELS[comparison_method],
                     "reference_method": "bp",
+                    "reference_method_label": METHOD_LABELS["bp"],
                     "seeds": ",".join(map(str, SEEDS)),
                     "comparison_minus_bp_primary_mean": primary_mean,
                     "comparison_minus_bp_primary_sample_std": primary_std,
@@ -438,12 +420,12 @@ def aggregate(run_dir: Path) -> dict[str, Any]:
                 }
             )
 
-    method_csv = run_dir / "reduced_mixer_summary.csv"
+    method_csv = run_dir / "summary.csv"
     with method_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(method_rows[0]))
         writer.writeheader()
         writer.writerows(method_rows)
-    paired_csv = run_dir / "reduced_mixer_paired.csv"
+    paired_csv = run_dir / "paired_differences.csv"
     with paired_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(paired_rows[0]))
         writer.writeheader()
@@ -453,6 +435,7 @@ def aggregate(run_dir: Path) -> dict[str, Any]:
         "completed_runs": len(indexed),
         "datasets": list(DATASETS),
         "methods": list(METHODS),
+        "method_labels": METHOD_LABELS,
         "seeds": list(SEEDS),
         "method_rows": method_rows,
         "paired_rows": paired_rows,
@@ -462,7 +445,7 @@ def aggregate(run_dir: Path) -> dict[str, Any]:
             "placement, gradient routing, optimizer topology, and prediction rule"
         ),
     }
-    atomic_json(run_dir / "reduced_mixer_summary.json", summary)
+    atomic_json(run_dir / "summary.json", summary)
     return summary
 
 
@@ -500,22 +483,9 @@ def prepare_run_directory(run_dir: Path, manifest: dict[str, Any]) -> bool:
         manifest_path = run_dir / "manifest.json"
         if not manifest_path.is_file():
             entries = {path.name for path in run_dir.iterdir()}
-            allowed_prelaunch_entries = {
-                "source",
-                "source_snapshot.sha256",
-                "scheduler.log",
-                "scheduler.pid",
-            }
+            allowed_prelaunch_entries = {"scheduler.log", "scheduler.pid"}
             if (
                 not entries.issubset(allowed_prelaunch_entries)
-                or (
-                    (run_dir / "source").exists()
-                    and not (run_dir / "source").is_dir()
-                )
-                or (
-                    (run_dir / "source_snapshot.sha256").exists()
-                    and not (run_dir / "source_snapshot.sha256").is_file()
-                )
                 or (
                     (run_dir / "scheduler.log").exists()
                     and not (run_dir / "scheduler.log").is_file()
@@ -582,9 +552,7 @@ def main() -> int:
     run_dir = args.run_dir.resolve()
     project_root = args.project_root.resolve()
     matrix = jobs()
-    _tiny_root, tiny_integrity = ensure_tiny(
-        project_root / "data", allow_download=True
-    )
+    _tiny_root, tiny_integrity = ensure_tiny(project_root / "data", allow_download=True)
     validate_dataset_integrity_record("tinyimagenet", tiny_integrity)
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
@@ -597,6 +565,7 @@ def main() -> int:
             "purpose": "Three matched cross-entropy reference baselines for the paper",
             "datasets": list(DATASETS),
             "methods": list(METHODS),
+            "method_labels": METHOD_LABELS,
             "seeds": list(SEEDS),
             "architecture": {
                 "mixer_blocks": 5,
@@ -640,9 +609,9 @@ def main() -> int:
         "source_sha256": {
             name: file_sha256(project_root / name)
             for name in (
-                "MLPMixerBenchmarkSuite.py",
-                "medmnist_support.py",
-                "ReducedMixerBenchmarkScheduler.py",
+                "mixer_experiment.py",
+                "pathmnist_data.py",
+                "mixer_benchmark.py",
             )
         },
         "dataset_integrity": {"tinyimagenet": tiny_integrity},
@@ -685,7 +654,9 @@ def main() -> int:
                 "failed": len(failures),
                 "current_index": index,
                 "current": {"dataset": dataset, "method": method, "seed": seed},
-                "heartbeat": str(job_dir(run_dir, dataset, method, seed) / "heartbeat.json"),
+                "heartbeat": str(
+                    job_dir(run_dir, dataset, method, seed) / "heartbeat.json"
+                ),
                 "updated_at_utc": datetime.now(timezone.utc).isoformat(),
             },
         )

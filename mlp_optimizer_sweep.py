@@ -2,7 +2,7 @@
 """Plan, run, select, finalize, and aggregate the paper MLP sweep.
 
 Training and test evaluation are deliberately separate.  Every optimizer
-candidate is trained with ``MLPBenchmarkSuite.py run --defer-test``.  A profile
+candidate is trained with ``mlp_experiment.py run --defer-test``.  A profile
 is then frozen for each dataset/method using the mean best-validation accuracy
 over seeds 424--426.  Only the three checkpoints belonging to that frozen
 profile are evaluated on the official test split, exactly once.
@@ -34,25 +34,12 @@ import uuid
 
 import torch
 
-import MLPBenchmarkSuite as suite
+import mlp_experiment as suite
+from mlp_experiment import ARCHITECTURES, DATASETS, FC_METHODS, PRIMARY_METHODS
 
 
 SCHEMA_VERSION = 3
 SEEDS = (424, 425, 426)
-DATASETS = ("mnist", "fashionmnist", "cifar10", "cifar100")
-PRIMARY_METHODS = (
-    "ff",
-    "ff-matched-ge",
-    "ff-ge",
-    "nn-ff-ge",
-    "fc-ff",
-    "fc-ff-matched-ge",
-    "fc-ff-ge",
-    "fc-nn-ff-ge",
-    "local-bp",
-    "ce-matched-ge",
-    "bp",
-)
 METHOD_LABELS = {
     "ff": "Vanilla FF (Local, Multi-Head)",
     "ff-matched-ge": "FF (Global, Multi-Head)",
@@ -66,23 +53,10 @@ METHOD_LABELS = {
     "ce-matched-ge": "CE (Global, Multi-Head)",
     "bp": "CE (Global, Terminal)",
 }
-FC_METHODS = {
-    "fc-ff",
-    "fc-ff-matched-ge",
-    "fc-ff-ge",
-    "fc-nn-ff-ge",
-}
 THRESHOLDED_METHODS = {"ff", "ff-matched-ge", "ff-ge", "nn-ff-ge"}
-ARCHITECTURES = {
-    "mnist": (1000, 1000),
-    "fashionmnist": (1000, 1000),
-    "cifar10": (2000, 2000, 2000),
-    "cifar100": (2000, 2000, 2000),
-}
 
 # These paper-facing values were selected by the separate constant-Adam
-# threshold study and are frozen before the optimizer sweep. The compatibility
-# local controls are outside the paper matrix and are not scheduled here.
+# threshold study and are frozen before the optimizer sweep.
 FROZEN_THRESHOLDS: dict[str, dict[str, float]] = {
     "mnist": {"ff": 4.0, "ff-matched-ge": 1.0, "ff-ge": 4.0, "nn-ff-ge": 4.0},
     "fashionmnist": {
@@ -141,9 +115,9 @@ CANDIDATE_CHUNK = 10
 NUM_WORKERS = 4
 DEADLINE_BUFFER = timedelta(minutes=20)
 SOURCE_FILES = (
-    "decomposition_core.py",
-    "MLPBenchmarkSuite.py",
-    "MLPOptimizerSweepScheduler.py",
+    "mlp_components.py",
+    "mlp_experiment.py",
+    "mlp_optimizer_sweep.py",
 )
 
 
@@ -157,7 +131,9 @@ def utc_now() -> str:
 def atomic_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     os.replace(temporary, path)
 
 
@@ -182,19 +158,23 @@ def file_sha256(path: Path) -> str:
 
 
 def object_sha256(payload: Any) -> str:
-    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode(
-        "utf-8"
-    )
+    encoded = json.dumps(
+        payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
 def signed_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    unsigned = {key: value for key, value in payload.items() if key != "integrity_sha256"}
+    unsigned = {
+        key: value for key, value in payload.items() if key != "integrity_sha256"
+    }
     return {**unsigned, "integrity_sha256": object_sha256(unsigned)}
 
 
 def verify_signature(payload: Mapping[str, Any], *, context: str) -> None:
-    unsigned = {key: value for key, value in payload.items() if key != "integrity_sha256"}
+    unsigned = {
+        key: value for key, value in payload.items() if key != "integrity_sha256"
+    }
     if payload.get("integrity_sha256") != object_sha256(unsigned):
         raise RuntimeError(f"Integrity checksum mismatch: {context}")
 
@@ -221,7 +201,9 @@ def methods_for(dataset: str) -> tuple[str, ...]:
 
 def identities(datasets: Sequence[str] | None = None) -> list[tuple[str, str]]:
     selected = normalize_datasets(datasets)
-    return [(dataset, method) for dataset in selected for method in methods_for(dataset)]
+    return [
+        (dataset, method) for dataset in selected for method in methods_for(dataset)
+    ]
 
 
 def jobs(datasets: Sequence[str] | None = None) -> list[Job]:
@@ -237,13 +219,13 @@ def validate_runner_contract() -> None:
     observed_primary = tuple(getattr(suite, "PRIMARY_METHODS", ()))
     if observed_primary != PRIMARY_METHODS:
         raise RuntimeError(
-            "MLPBenchmarkSuite.PRIMARY_METHODS does not match the paper scheduler: "
+            "mlp_experiment.PRIMARY_METHODS does not match the paper scheduler: "
             f"{observed_primary!r} != {PRIMARY_METHODS!r}"
         )
     observed_fc = set(getattr(suite, "FC_METHODS", set()))
     if observed_fc != FC_METHODS:
         raise RuntimeError(
-            f"MLPBenchmarkSuite.FC_METHODS mismatch: {observed_fc!r} != {FC_METHODS!r}"
+            f"mlp_experiment.FC_METHODS mismatch: {observed_fc!r} != {FC_METHODS!r}"
         )
 
 
@@ -267,7 +249,9 @@ def validate_thresholds(
         for method in sorted(expected_methods):
             value = float(thresholds[dataset][method])
             if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"Invalid frozen threshold for {dataset}/{method}: {value}")
+                raise ValueError(
+                    f"Invalid frozen threshold for {dataset}/{method}: {value}"
+                )
             normalized[dataset][method] = value
     return normalized
 
@@ -347,11 +331,13 @@ def command_for(
     if profile not in PROFILES:
         raise ValueError(f"Unknown profile: {profile}")
     if method not in methods_for(dataset) or seed not in SEEDS:
-        raise ValueError(f"Job is outside the paper matrix: {(profile, dataset, method, seed)}")
+        raise ValueError(
+            f"Job is outside the paper matrix: {(profile, dataset, method, seed)}"
+        )
     settings = PROFILES[profile]
     command = [
         python_executable,
-        str(project_root / "MLPBenchmarkSuite.py"),
+        str(project_root / "mlp_experiment.py"),
         "run",
         "--dataset",
         dataset,
@@ -486,10 +472,14 @@ def build_manifest(
         "source_sha256": source_hashes(project_root),
         "protocol": {
             "datasets": list(selected),
-            "methods_by_dataset": {dataset: list(methods_for(dataset)) for dataset in selected},
+            "methods_by_dataset": {
+                dataset: list(methods_for(dataset)) for dataset in selected
+            },
             "method_labels": METHOD_LABELS,
             "seeds": list(SEEDS),
-            "architectures": {dataset: list(ARCHITECTURES[dataset]) for dataset in selected},
+            "architectures": {
+                dataset: list(ARCHITECTURES[dataset]) for dataset in selected
+            },
             "profiles": PROFILES,
             "profile_tie_break_order": list(PROFILE_TIE_BREAK),
             "maximum_epochs": MAXIMUM_EPOCHS,
@@ -541,18 +531,26 @@ def manifest_path(run_dir: Path) -> Path:
     return run_dir / "manifest.json"
 
 
-def write_or_resume_manifest(run_dir: Path, candidate: dict[str, Any]) -> dict[str, Any]:
+def write_or_resume_manifest(
+    run_dir: Path, candidate: dict[str, Any]
+) -> dict[str, Any]:
     path = manifest_path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     if path.exists():
         existing = json.loads(path.read_text(encoding="utf-8"))
         verify_signature(existing, context=str(path))
         if existing.get("spec_sha256") != candidate.get("spec_sha256"):
-            raise RuntimeError(f"Existing run manifest has a different protocol: {path}")
+            raise RuntimeError(
+                f"Existing run manifest has a different protocol: {path}"
+            )
         return existing
-    unexpected = [entry for entry in run_dir.iterdir() if entry.name != "scheduler.lock"]
+    unexpected = [
+        entry for entry in run_dir.iterdir() if entry.name != "scheduler.lock"
+    ]
     if unexpected:
-        raise RuntimeError(f"Refusing non-empty run directory without a manifest: {run_dir}")
+        raise RuntimeError(
+            f"Refusing non-empty run directory without a manifest: {run_dir}"
+        )
     atomic_json(path, candidate)
     return candidate
 
@@ -610,7 +608,9 @@ def finite_accuracy(value: Any, *, context: str) -> float:
 def verify_training_run(
     manifest: Mapping[str, Any], profile: str, dataset: str, method: str, seed: int
 ) -> dict[str, Any]:
-    directory = result_directory(Path(manifest["run_dir"]), profile, dataset, method, seed)
+    directory = result_directory(
+        Path(manifest["run_dir"]), profile, dataset, method, seed
+    )
     run_path = directory / "run.json"
     config_path = directory / "config.json"
     history_path = directory / "history.csv"
@@ -620,7 +620,9 @@ def verify_training_run(
     if payload.get("schema_version") != 2:
         raise RuntimeError(f"Unexpected run schema: {run_path}")
     if payload.get("status") != "train_complete":
-        raise RuntimeError(f"Candidate is not an untouched deferred-test run: {run_path}")
+        raise RuntimeError(
+            f"Candidate is not an untouched deferred-test run: {run_path}"
+        )
     if payload.get("test") is not None or int(payload.get("test_evaluations", -1)) != 0:
         raise RuntimeError(f"Candidate test data must be absent: {run_path}")
     if payload.get("config") != expected:
@@ -695,7 +697,11 @@ def freeze_selection(
         candidates: list[tuple[float, int, str]] = []
         for preference, profile in enumerate(PROFILE_TIE_BREAK):
             values = [
-                float(records[(profile, dataset, method, seed)]["best_validation_accuracy"])
+                float(
+                    records[(profile, dataset, method, seed)][
+                        "best_validation_accuracy"
+                    ]
+                )
                 for seed in SEEDS
             ]
             mean = statistics.mean(values)
@@ -761,7 +767,9 @@ def selection_path(run_dir: Path) -> Path:
     return run_dir / "selection.json"
 
 
-def write_or_verify_selection(run_dir: Path, candidate: dict[str, Any]) -> dict[str, Any]:
+def write_or_verify_selection(
+    run_dir: Path, candidate: dict[str, Any]
+) -> dict[str, Any]:
     def substantive(item: Mapping[str, Any]) -> dict[str, Any]:
         return {
             key: value
@@ -780,7 +788,9 @@ def write_or_verify_selection(run_dir: Path, candidate: dict[str, Any]) -> dict[
     return candidate
 
 
-def verify_frozen_selection(manifest: Mapping[str, Any], selection: Mapping[str, Any]) -> None:
+def verify_frozen_selection(
+    manifest: Mapping[str, Any], selection: Mapping[str, Any]
+) -> None:
     verify_signature(selection, context="selection.json")
     if selection.get("manifest_integrity_sha256") != manifest.get("integrity_sha256"):
         raise RuntimeError("Selection was created from a different manifest")
@@ -833,10 +843,14 @@ def evaluate_checkpoint(
         test_limit=config.get("test_limit"),
     )
     if split["validation_index_sha256"] != selected_run["validation_index_sha256"]:
-        raise RuntimeError(f"Evaluation split mismatch for {dataset}/{method}/seed {seed}")
+        raise RuntimeError(
+            f"Evaluation split mismatch for {dataset}/{method}/seed {seed}"
+        )
     current_manifest = suite.dataset_manifest(data_dir, dataset)
     if current_manifest != source["dataset"]["source_manifest"]:
-        raise RuntimeError(f"Evaluation dataset differs from training data for {dataset}")
+        raise RuntimeError(
+            f"Evaluation dataset differs from training data for {dataset}"
+        )
     model = suite.build_model(
         method,
         dataset,
@@ -874,7 +888,10 @@ def verify_test_record(
     }
     if any(payload.get(key) != value for key, value in expected.items()):
         raise RuntimeError(f"Test provenance mismatch: {path}")
-    if payload.get("status") != "complete" or int(payload.get("test_evaluations", -1)) != 1:
+    if (
+        payload.get("status") != "complete"
+        or int(payload.get("test_evaluations", -1)) != 1
+    ):
         raise RuntimeError(f"Invalid final test record: {path}")
     finite_accuracy(payload.get("test", {}).get("accuracy"), context=str(path))
     return payload
@@ -890,7 +907,9 @@ def finalize_selected(
     verify_frozen_selection(manifest, selection)
     device = torch.device(device_name)
     if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is unavailable; refusing CPU fallback")
+        raise RuntimeError(
+            "CUDA was requested but is unavailable; refusing CPU fallback"
+        )
     completed: list[dict[str, Any]] = []
     run_dir = Path(manifest["run_dir"])
     for choice in selection["choices"]:
@@ -902,7 +921,9 @@ def finalize_selected(
             output = test_record_path(run_dir, profile, dataset, method, seed)
             started = output.with_name("test.started.json")
             if output.exists():
-                completed.append(verify_test_record(output, selection, choice, selected_run))
+                completed.append(
+                    verify_test_record(output, selection, choice, selected_run)
+                )
                 continue
             if started.exists():
                 raise RuntimeError(
@@ -941,25 +962,35 @@ def finalize_selected(
                     "test_evaluations": 1,
                     "evaluated_at_utc": utc_now(),
                     "device": str(device),
-                    "gpu": (torch.cuda.get_device_name(device) if device.type == "cuda" else None),
+                    "gpu": (
+                        torch.cuda.get_device_name(device)
+                        if device.type == "cuda"
+                        else None
+                    ),
                 }
             )
             atomic_json(output, payload)
-            completed.append(verify_test_record(output, selection, choice, selected_run))
+            completed.append(
+                verify_test_record(output, selection, choice, selected_run)
+            )
             atomic_json(
                 run_dir / "heartbeat.json",
                 {
                     "stage": "finalize",
                     "updated_at_utc": utc_now(),
                     "completed_test_evaluations": len(completed),
-                    "expected_test_evaluations": len(identities(manifest["protocol"]["datasets"]))
+                    "expected_test_evaluations": len(
+                        identities(manifest["protocol"]["datasets"])
+                    )
                     * len(SEEDS),
                 },
             )
     return completed
 
 
-def aggregate_results(manifest: Mapping[str, Any], selection: Mapping[str, Any]) -> dict[str, Any]:
+def aggregate_results(
+    manifest: Mapping[str, Any], selection: Mapping[str, Any]
+) -> dict[str, Any]:
     verify_frozen_selection(manifest, selection)
     run_dir = Path(manifest["run_dir"])
     rows: list[dict[str, Any]] = []
@@ -969,7 +1000,9 @@ def aggregate_results(manifest: Mapping[str, Any], selection: Mapping[str, Any])
         method = str(choice["method"])
         tests = [
             verify_test_record(
-                test_record_path(run_dir, profile, dataset, method, int(record["seed"])),
+                test_record_path(
+                    run_dir, profile, dataset, method, int(record["seed"])
+                ),
                 selection,
                 choice,
                 record,
@@ -1030,7 +1063,9 @@ def parse_utc(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def deadline_allows_start(stop_before_utc: datetime | None, *, now: datetime | None = None) -> bool:
+def deadline_allows_start(
+    stop_before_utc: datetime | None, *, now: datetime | None = None
+) -> bool:
     if stop_before_utc is None:
         return True
     current = now or datetime.now(timezone.utc)
@@ -1118,7 +1153,11 @@ def status_snapshot(manifest: Mapping[str, Any]) -> dict[str, Any]:
         directory = result_directory(run_dir, profile, dataset, method, seed)
         path = directory / "run.json"
         if not path.exists():
-            counts["partial" if directory.exists() and any(directory.iterdir()) else "planned"] += 1
+            counts[
+                "partial"
+                if directory.exists() and any(directory.iterdir())
+                else "planned"
+            ] += 1
             continue
         try:
             verify_training_run(manifest, profile, dataset, method, seed)
@@ -1134,7 +1173,9 @@ def status_snapshot(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_total": len(manifest["jobs"]),
         "selection_frozen": selection,
         "final_test_records": tests,
-        "expected_final_test_records": manifest["protocol"]["selected_test_evaluations"],
+        "expected_final_test_records": manifest["protocol"][
+            "selected_test_evaluations"
+        ],
         "summary_ready": (run_dir / "summary.json").is_file(),
         "updated_at_utc": utc_now(),
     }
@@ -1159,7 +1200,9 @@ def plan_command(args: argparse.Namespace) -> int:
                 "status": "planned",
                 "run_dir": str(run_dir),
                 "candidate_jobs": len(manifest["jobs"]),
-                "selected_test_evaluations": manifest["protocol"]["selected_test_evaluations"],
+                "selected_test_evaluations": manifest["protocol"][
+                    "selected_test_evaluations"
+                ],
                 "manifest": str(manifest_path(run_dir)),
             },
             indent=2,
@@ -1298,7 +1341,9 @@ def finalize_command(args: argparse.Namespace) -> int:
 
 def aggregate_command(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.run_dir.resolve())
-    selection = json.loads(selection_path(Path(manifest["run_dir"])).read_text(encoding="utf-8"))
+    selection = json.loads(
+        selection_path(Path(manifest["run_dir"])).read_text(encoding="utf-8")
+    )
     summary = aggregate_results(manifest, selection)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
@@ -1310,7 +1355,9 @@ def parser() -> argparse.ArgumentParser:
 
     plan = commands.add_parser("plan", help="freeze the complete candidate manifest")
     plan.add_argument("--run-dir", type=Path, required=True)
-    plan.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent)
+    plan.add_argument(
+        "--project-root", type=Path, default=Path(__file__).resolve().parent
+    )
     plan.add_argument("--python", default=sys.executable)
     plan.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
     plan.add_argument(
@@ -1321,7 +1368,9 @@ def parser() -> argparse.ArgumentParser:
     )
     plan.set_defaults(function=plan_command, mutates=True)
 
-    launch = commands.add_parser("launch", help="train or resume deferred-test candidates")
+    launch = commands.add_parser(
+        "launch", help="train or resume deferred-test candidates"
+    )
     launch.add_argument("--run-dir", type=Path, required=True)
     launch.add_argument(
         "--stop-before-utc",
@@ -1344,7 +1393,9 @@ def parser() -> argparse.ArgumentParser:
     finalize.add_argument("--selection-only", action="store_true")
     finalize.set_defaults(function=finalize_command, mutates=True)
 
-    aggregate = commands.add_parser("aggregate", help="verify and summarize final tests")
+    aggregate = commands.add_parser(
+        "aggregate", help="verify and summarize final tests"
+    )
     aggregate.add_argument("--run-dir", type=Path, required=True)
     aggregate.set_defaults(function=aggregate_command, mutates=True)
     return root

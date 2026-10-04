@@ -203,6 +203,7 @@ def _expected_config(dataset: str, method: str, seed: int) -> dict[str, Any]:
         ),
         "detach_between_layers": method == "ff-matched-local",
         "prediction": "summed layer goodness",
+        "terminal_classifier_bias": None,
         "candidate_chunk": 10,
         "num_workers": 4,
         "download": False,

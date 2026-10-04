@@ -28,10 +28,10 @@ from ReducedMixerBenchmarkScheduler import (
 )
 
 
-def test_reduced_mixer_scheduler_defines_24_fresh_process_jobs() -> None:
+def test_reduced_mixer_scheduler_defines_36_fresh_process_jobs() -> None:
     matrix = jobs()
-    assert len(matrix) == 24
-    assert len(set(matrix)) == 24
+    assert len(matrix) == 36
+    assert len(set(matrix)) == 36
     assert {dataset for dataset, _seed, _method in matrix} == set(DATASETS)
     assert {seed for _dataset, seed, _method in matrix} == set(SEEDS)
     assert {method for _dataset, _seed, method in matrix} == set(METHODS)
@@ -56,7 +56,11 @@ def test_reduced_mixer_command_uses_the_fixed_protocol(tmp_path: Path) -> None:
     assert "--lr 0.0003" in joined
     assert "--weight-decay 0.05" in joined
     assert "--batch-size 128" in joined
+    assert "--token-dim 256" in joined
+    assert "--channel-dim 1024" in joined
     assert "--local-bp-updates-per-block 1" in joined
+    assert "--heartbeat-file" in command
+    assert str(job_dir(tmp_path, "cifar10", "local-bp", 424) / "heartbeat.json") in command
     assert "--checkpoint-dir" in joined
     assert "--download-tinyimagenet" not in command
 
@@ -107,11 +111,8 @@ def test_reduced_mixer_accepts_only_launcher_precreated_entries(
         "jobs": [{"dataset": "cifar10"}],
         "started_at_utc": "first",
     }
-    (tmp_path / "source").mkdir()
-    (tmp_path / "source_snapshot.sha256").write_text(
-        "snapshot", encoding="utf-8"
-    )
     (tmp_path / "scheduler.log").touch()
+    (tmp_path / "scheduler.pid").write_text("123\n", encoding="utf-8")
     assert prepare_run_directory(tmp_path, manifest) is False
     assert (tmp_path / "manifest.json").is_file()
 
@@ -343,12 +344,16 @@ def test_reduced_mixer_aggregate_computes_paired_deltas_and_memory_ratios(
 
     summary = aggregate(tmp_path)
 
-    assert summary["completed_runs"] == 24
-    assert len(summary["method_rows"]) == 8
-    assert len(summary["paired_rows"]) == 4
+    assert summary["completed_runs"] == 36
+    assert len(summary["method_rows"]) == 12
+    assert len(summary["paired_rows"]) == 8
     for row in summary["paired_rows"]:
-        assert row["local_minus_bp_primary_mean"] == pytest.approx(0.01)
-        assert row["local_over_bp_memory_mean"] == pytest.approx(0.4)
+        expected_delta = 0.01 if row["comparison_method"] == "local-bp" else 0.0
+        expected_ratio = 0.4 if row["comparison_method"] == "local-bp" else 1.0
+        assert row["comparison_minus_bp_primary_mean"] == pytest.approx(
+            expected_delta
+        )
+        assert row["comparison_over_bp_memory_mean"] == pytest.approx(expected_ratio)
     assert (tmp_path / "reduced_mixer_summary.json").is_file()
     assert (tmp_path / "reduced_mixer_summary.csv").is_file()
     assert (tmp_path / "reduced_mixer_paired.csv").is_file()

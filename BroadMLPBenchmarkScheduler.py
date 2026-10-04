@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Run and verify the fixed broad MLP benchmark matrix reported in the paper."""
+"""Run a legacy seven-method exploratory MLP matrix.
+
+This scheduler predates the eleven-variant paper protocol. Use
+MLPThresholdSweepScheduler.py and MLPOptimizerSweepScheduler.py for the current
+paper experiments.
+"""
 
 from __future__ import annotations
 
@@ -226,7 +231,7 @@ def _expected_config(dataset: str, method: str, seed: int) -> dict[str, Any]:
         "goodness_threshold": 2.0 if method in {"ff", "ff-ge"} else None,
         "matched_locality_control": False,
         "matched_loss_placement": None,
-        "detach_between_layers": None,
+        "detach_between_layers": True if method == "local-bp" else None,
         "candidate_chunk": 10,
         "num_workers": 4,
         "download": False,

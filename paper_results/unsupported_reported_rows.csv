@@ -1,0 +1,15 @@
+architecture,dataset,method_id,method_label,reported_mean_accuracy_percent,reported_sample_std_percent,reason
+mlp,cifar100,ff,"Vanilla FF (Local, Multi-Head)",7.40,0.30,no matching complete local three-seed result artifact
+mlp,mnist,ff-matched-ge,"FF (Global, Multi-Head)",97.26,0.04,no matching complete local three-seed result artifact
+mlp,mnist,ff-ge,"FF (Global, Terminal)",97.52,0.28,no matching complete local three-seed result artifact
+mlp,fashionmnist,ff-ge,"FF (Global, Terminal)",86.77,0.29,no matching complete local three-seed result artifact
+mlp,cifar10,ff-ge,"FF (Global, Terminal)",53.30,0.09,no matching complete local three-seed result artifact
+mlp,cifar100,ff-ge,"FF (Global, Terminal)",14.88,0.62,no matching complete local three-seed result artifact
+mlp,fashionmnist,nn-ff-ge,"NN-FF (Global, Terminal)",89.12,0.26,no matching complete local three-seed result artifact
+mlp,cifar100,nn-ff-ge,"NN-FF (Global, Terminal)",17.36,2.59,no matching complete local three-seed result artifact
+mlp,mnist,fc-ff-matched-ge,"FC-FF (Global, Multi-Head)",97.77,0.18,no matching complete local three-seed result artifact
+mlp,fashionmnist,fc-ff-matched-ge,"FC-FF (Global, Multi-Head)",88.54,0.70,no matching complete local three-seed result artifact
+mlp_mixer,cifar10,ce-matched-ge,"CE (Global, Multi-Head)",79.61,0.70,no local per-seed or aggregate result artifact for this method and dataset
+mlp_mixer,cifar100,ce-matched-ge,"CE (Global, Multi-Head)",50.80,0.95,no local per-seed or aggregate result artifact for this method and dataset
+mlp_mixer,pathmnist,ce-matched-ge,"CE (Global, Multi-Head)",86.51,0.57,no local per-seed or aggregate result artifact for this method and dataset
+mlp_mixer,tinyimagenet,ce-matched-ge,"CE (Global, Multi-Head)",37.39,0.42,no local per-seed or aggregate result artifact for this method and dataset

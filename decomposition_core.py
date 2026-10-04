@@ -123,7 +123,8 @@ class BackpropMLP(nn.Module):
         for index in range(len(dims) - 1):
             modules.extend((nn.Linear(dims[index], dims[index + 1]), nn.ReLU()))
         self.features = nn.Sequential(*modules)
-        self.classifier = nn.Linear(dims[-1], num_classes)
+        # No-bias BP control: omit only the terminal classifier's additive bias.
+        self.classifier = nn.Linear(dims[-1], num_classes, bias=False)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.classifier(self.features(inputs))

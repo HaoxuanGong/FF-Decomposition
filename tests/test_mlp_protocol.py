@@ -7,6 +7,8 @@ from torch.utils.data import TensorDataset
 
 from decomposition_core import LocalBPMLP
 from MLPBenchmarkSuite import (
+    FC_METHODS,
+    PRIMARY_METHODS,
     build_model,
     configuration,
     expected_matrix,
@@ -33,11 +35,12 @@ def test_stratified_split_is_deterministic_balanced_and_disjoint() -> None:
 
 
 def test_no_inter_layer_normalization_variant_retains_first_layer_normalization() -> None:
-    model = build_model("fc-nn-ff-ge", "mnist")
-    assert getattr(model, "normalize") is False
-    assert getattr(model, "normalize_first_layer_input") is True
-    assert model.normalizes_layer_input(0) is True
-    assert model.normalizes_layer_input(1) is False
+    for method in ("nn-ff-ge", "fc-nn-ff-ge"):
+        model = build_model(method, "mnist")
+        assert getattr(model, "normalize") is False
+        assert getattr(model, "normalize_first_layer_input") is True
+        assert model.normalizes_layer_input(0) is True
+        assert model.normalizes_layer_input(1) is False
 
 
 def test_hidden_dimension_override_is_recorded_and_built() -> None:
@@ -66,6 +69,46 @@ def test_hidden_dimension_override_is_recorded_and_built() -> None:
         "fc-ff-ge", "fashionmnist", hidden_dims=tuple(config["hidden_dims"])
     )
     assert [layer.out_features for layer in model.layers] == [500] * 5
+
+
+def test_direct_mlp_step_scheduler_default_matches_the_paper_profile() -> None:
+    args = parser().parse_args(
+        [
+            "run",
+            "--dataset",
+            "mnist",
+            "--method",
+            "bp",
+            "--seed",
+            "424",
+            "--scheduler",
+            "step",
+            "--output-dir",
+            "results",
+        ]
+    )
+    assert args.step_size == 30
+    assert args.step_gamma == 0.1
+
+
+def test_cross_entropy_metadata_does_not_claim_a_goodness_objective() -> None:
+    for method, expected_detach in (("bp", None), ("local-bp", True)):
+        args = parser().parse_args(
+            [
+                "run",
+                "--dataset",
+                "mnist",
+                "--method",
+                method,
+                "--seed",
+                "424",
+                "--output-dir",
+                "results",
+            ]
+        )
+        config = configuration(args)
+        assert config["goodness_definition"] is None
+        assert config["detach_between_layers"] is expected_detach
 
 
 def test_matched_ce_methods_differ_only_in_gradient_locality() -> None:
@@ -117,8 +160,14 @@ def test_matched_ce_methods_differ_only_in_gradient_locality() -> None:
 
 def test_full_paper_matrix_has_expected_omissions() -> None:
     matrix = expected_matrix()
-    assert len(matrix) == 123
+    assert len(PRIMARY_METHODS) == 11
+    assert len(matrix) == 120
+    assert {method for _dataset, method, _seed in matrix} == set(PRIMARY_METHODS)
     assert not any(
-        dataset == "cifar100" and method.startswith("fc-")
+        dataset == "cifar100" and method in FC_METHODS
         for dataset, method, _seed in matrix
+    )
+    assert not any(
+        method in {"ff-matched-local", "ce-matched-local"}
+        for _dataset, method, _seed in matrix
     )

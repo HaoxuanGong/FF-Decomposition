@@ -11,14 +11,32 @@ import torch.nn.functional as F
 
 from MLPMixerBenchmarkSuite import (
     LocalBPMixer,
+    PAPER_DEPTHS,
+    PAPER_DIMS,
+    PAPER_SEEDS,
     build_local_bp_scalers,
     coil100_integrity,
     ensure_download,
     index_sha256,
+    parse_args,
+    resolve_seeds,
     stratified_train_validation_indices,
     tinyimagenet_integrity,
 )
 from medmnist_support import logits_to_scores, prepare_targets, task_loss
+
+
+def test_direct_mixer_defaults_match_the_paper_profile() -> None:
+    args = parse_args(["--datasets", "cifar10"])
+    assert PAPER_SEEDS == (424, 425, 426)
+    assert PAPER_DEPTHS == (5,)
+    assert PAPER_DIMS == (256,)
+    assert resolve_seeds(args) == [424, 425, 426]
+    assert args.methods == ["bp", "local-bp", "ce-matched-ge"]
+    assert args.epochs == 200
+    assert args.early_stop_patience == 15
+    assert args.early_stop_min_delta == 0.0
+    assert args.local_bp_updates_per_block == 1
 
 
 def test_mixer_split_is_deterministic_stratified_and_disjoint() -> None:
@@ -75,6 +93,30 @@ def test_local_mixer_detaches_the_upstream_block_for_a_downstream_local_loss() -
     assert any(
         parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
         for parameter in downstream
+    )
+
+
+def test_global_multihead_mixer_last_loss_reaches_all_preceding_blocks() -> None:
+    torch.manual_seed(5)
+    model = LocalBPMixer(
+        in_channels=3,
+        num_classes=4,
+        image_size=8,
+        patch_size=4,
+        model_dim=8,
+        depth=2,
+        token_hidden_dim=4,
+        channel_hidden_dim=16,
+        dropout=0.0,
+    )
+    images = torch.randn(3, 3, 8, 8)
+    targets = torch.tensor([0, 1, 2])
+    logits = model.layer_logits(images)
+    F.cross_entropy(logits[-1], targets).backward()
+    upstream = [*model.patch_embedding.parameters(), *model.blocks[0].parameters()]
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in upstream
     )
 
 

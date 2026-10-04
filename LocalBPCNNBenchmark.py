@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Compare BP and Local BP on a matched four-block CNN.
+"""Compare three cross-entropy controls on a matched four-block CNN.
 
-Both methods use the same Conv--BatchNorm--ReLU--MaxPool backbone. BP applies
+All methods use the same Conv--BatchNorm--ReLU--MaxPool backbone. BP applies
 one cross-entropy loss to the final classifier and propagates its gradient
 through the complete backbone. Local BP attaches a classifier to every block,
 optimizes each block and classifier with a local cross-entropy loss, and
-detaches the activation passed between blocks. Local BP predicts by summing
-the logits of its local classifiers.
+detaches the activation passed between blocks. CE (Global, Multi-Head) uses
+the same per-block classifiers, losses, and summed-logit prediction rule as
+Local BP, but removes the detachments and performs one global update from the
+sum of the four cross-entropy losses.
 
 For every seed, a deterministic stratified subset of the official training
 split is reserved for validation. Validation accuracy selects the checkpoint
@@ -38,7 +40,7 @@ import torch
 import torch.nn as nn
 import torchvision
 from torch.optim import Adam, SGD
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision.datasets import CIFAR10, CIFAR100, FashionMNIST, MNIST
 from torchvision.transforms import Compose, Normalize, ToTensor
@@ -72,7 +74,7 @@ DATASETS = {
     ),
 }
 
-METHODS = ("bp", "local-bp")
+METHODS = ("bp", "local-bp", "ce-matched-ge")
 BACKBONE_WIDTHS = (64, 128, 256, 512)
 WEIGHT_DECAY = 0.0
 DROPOUT = 0.0
@@ -91,6 +93,9 @@ class RunConfig:
     optimizer_parameters: str
     learning_rate: float
     scheduler: str
+    scheduler_parameters: str
+    step_size: int
+    step_gamma: float
     batch_size: int
     eval_batch_size: int
     seeds: list[int]
@@ -102,6 +107,9 @@ class RunConfig:
     save_checkpoints: bool
     provenance_run_id: str
     overwrite: bool
+    defer_test: bool
+    heartbeat_file: str
+    terminal_classifier_bias: bool = False
     backbone_widths: tuple[int, ...] = BACKBONE_WIDTHS
     validation_split: str = "seed-specific-stratified"
     test_evaluation_policy: str = "once-after-best-checkpoint-restoration"
@@ -120,7 +128,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--method",
         choices=METHODS,
         required=True,
-        help="Use terminal BP or detached layer-local BP on the matched backbone.",
+        help=(
+            "Use terminal CE, detached per-block CE, or globally propagated "
+            "per-block CE on the matched backbone."
+        ),
     )
     parser.add_argument("--epochs", type=int, default=200, help="Maximum number of epochs.")
     parser.add_argument(
@@ -141,8 +152,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=5000,
         help="Number of examples reserved from the official training split.",
     )
-    parser.add_argument("--optimizer", choices=("sgd", "adam"), default="sgd")
-    parser.add_argument("--lr", "--learning-rate", dest="learning_rate", type=float, default=0.1)
+    parser.add_argument("--optimizer", choices=("sgd", "adam"), default="adam")
+    parser.add_argument(
+        "--lr", "--learning-rate", dest="learning_rate", type=float, default=0.001
+    )
+    parser.add_argument("--scheduler", choices=("cosine", "step"), default="cosine")
+    parser.add_argument("--step-size", type=int, default=30)
+    parser.add_argument("--step-gamma", type=float, default=0.1)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-batch-size", type=int, default=512)
     parser.add_argument(
@@ -162,6 +178,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--download", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-checkpoints", action="store_true")
+    parser.add_argument(
+        "--defer-test",
+        action="store_true",
+        help="Train and save validation-selected checkpoints without evaluating the test set.",
+    )
+    parser.add_argument(
+        "--heartbeat-file",
+        default="",
+        help="Optional JSON heartbeat path updated after every epoch.",
+    )
     parser.add_argument(
         "--provenance-run-id",
         default="standalone",
@@ -186,6 +212,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--validation-size must be positive")
     if args.learning_rate <= 0:
         raise ValueError("--learning-rate must be positive")
+    if args.step_size <= 0:
+        raise ValueError("--step-size must be positive")
+    if not 0 < args.step_gamma <= 1:
+        raise ValueError("--step-gamma must be in (0, 1]")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
     if args.eval_batch_size <= 0:
@@ -235,6 +265,12 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         if args.optimizer == "sgd"
         else "betas=(0.9,0.999),eps=1e-8"
     )
+    scheduler = "cosine-annealing" if args.scheduler == "cosine" else "step"
+    scheduler_parameters = (
+        f"T_max={args.epochs},eta_min=0"
+        if args.scheduler == "cosine"
+        else f"step_size={args.step_size},gamma={args.step_gamma}"
+    )
     return RunConfig(
         method=args.method,
         dataset=args.dataset,
@@ -245,7 +281,10 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         optimizer=args.optimizer,
         optimizer_parameters=optimizer_parameters,
         learning_rate=args.learning_rate,
-        scheduler="cosine-annealing",
+        scheduler=scheduler,
+        scheduler_parameters=scheduler_parameters,
+        step_size=args.step_size,
+        step_gamma=args.step_gamma,
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
         seeds=list(args.seeds),
@@ -257,6 +296,14 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         save_checkpoints=args.save_checkpoints,
         provenance_run_id=args.provenance_run_id,
         overwrite=args.overwrite,
+        defer_test=args.defer_test,
+        heartbeat_file=str(Path(args.heartbeat_file).expanduser()) if args.heartbeat_file else "",
+        terminal_classifier_bias=False,
+        test_evaluation_policy=(
+            "deferred-until-profile-selection"
+            if args.defer_test
+            else "once-after-best-checkpoint-restoration"
+        ),
     )
 
 
@@ -460,10 +507,10 @@ class ConvBlock(nn.Module):
 
 
 class ClassificationHead(nn.Module):
-    def __init__(self, input_channels: int, num_classes: int):
+    def __init__(self, input_channels: int, num_classes: int, *, bias: bool = True):
         super().__init__()
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.classifier = nn.Linear(input_channels, num_classes)
+        self.classifier = nn.Linear(input_channels, num_classes, bias=bias)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.classifier(torch.flatten(self.pool(features), 1))
@@ -480,10 +527,14 @@ def make_backbone(input_channels: int) -> nn.ModuleList:
 class BPCNN(nn.Module):
     """Matched backbone trained from one terminal cross-entropy objective."""
 
-    def __init__(self, input_channels: int, num_classes: int):
+    def __init__(
+        self, input_channels: int, num_classes: int, *, classifier_bias: bool = False
+    ):
         super().__init__()
         self.blocks = make_backbone(input_channels)
-        self.head = ClassificationHead(BACKBONE_WIDTHS[-1], num_classes)
+        self.head = ClassificationHead(
+            BACKBONE_WIDTHS[-1], num_classes, bias=classifier_bias
+        )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         features = inputs
@@ -514,12 +565,40 @@ class LocalBPCNN(nn.Module):
         return torch.stack(self.forward_local(inputs)).sum(dim=0)
 
 
+class GlobalMultiHeadCECNN(nn.Module):
+    """Matched per-block CE heads with gradients propagated through all blocks."""
+
+    def __init__(self, input_channels: int, num_classes: int):
+        super().__init__()
+        self.blocks = make_backbone(input_channels)
+        self.heads = nn.ModuleList(
+            ClassificationHead(width, num_classes) for width in BACKBONE_WIDTHS
+        )
+
+    def forward_heads(self, inputs: torch.Tensor) -> list[torch.Tensor]:
+        logits = []
+        features = inputs
+        for block, head in zip(self.blocks, self.heads):
+            features = block(features)
+            logits.append(head(features))
+        return logits
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return torch.stack(self.forward_heads(inputs)).sum(dim=0)
+
+
 def build_model(config: RunConfig) -> nn.Module:
     spec = DATASETS[config.dataset]
     if config.method == "bp":
-        return BPCNN(spec.input_channels, spec.num_classes)
+        return BPCNN(
+            spec.input_channels,
+            spec.num_classes,
+            classifier_bias=config.terminal_classifier_bias,
+        )
     if config.method == "local-bp":
         return LocalBPCNN(spec.input_channels, spec.num_classes)
+    if config.method == "ce-matched-ge":
+        return GlobalMultiHeadCECNN(spec.input_channels, spec.num_classes)
     raise ValueError(f"Unsupported method: {config.method}")
 
 
@@ -563,7 +642,26 @@ def build_optimizers(
             )
             for block, head in zip(model.blocks, model.heads)
         ]
+    if isinstance(model, GlobalMultiHeadCECNN):
+        return [build_optimizer(config.optimizer, model.parameters(), config.learning_rate)]
     raise TypeError(f"Unsupported model type: {type(model).__name__}")
+
+
+def build_schedulers(
+    optimizers: list[torch.optim.Optimizer],
+    config: RunConfig,
+) -> list[CosineAnnealingLR | StepLR]:
+    if config.scheduler == "cosine-annealing":
+        return [
+            CosineAnnealingLR(optimizer, T_max=config.epochs, eta_min=0)
+            for optimizer in optimizers
+        ]
+    if config.scheduler == "step":
+        return [
+            StepLR(optimizer, step_size=config.step_size, gamma=config.step_gamma)
+            for optimizer in optimizers
+        ]
+    raise ValueError(f"Unsupported scheduler: {config.scheduler}")
 
 
 def require_finite_tensor(name: str, tensor: torch.Tensor) -> None:
@@ -674,6 +772,58 @@ def train_local_bp_epoch(
     }
 
 
+def train_global_multihead_ce_epoch(
+    model: GlobalMultiHeadCECNN,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> dict[str, object]:
+    """Train matched per-block CE heads with one globally propagated update."""
+    model.train()
+    layer_loss_sums = [0.0] * len(model.blocks)
+    correct = 0
+    total_samples = 0
+
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        batch_size = labels.size(0)
+        total_samples += batch_size
+
+        optimizer.zero_grad(set_to_none=True)
+        logits_by_head = model.forward_heads(images)
+        losses = []
+        for index, logits in enumerate(logits_by_head):
+            require_finite_tensor(f"Global multi-head CE layer {index + 1} logits", logits)
+            loss = criterion(logits, labels)
+            require_finite_tensor(f"Global multi-head CE layer {index + 1} loss", loss)
+            losses.append(loss)
+            layer_loss_sums[index] += loss.item() * batch_size
+
+        # Summation preserves the full per-head gradient scale used by the
+        # existing local implementation, where each head performs its own CE
+        # update. The only intended change is the removal of stop-gradients.
+        total_loss = torch.stack(losses).sum()
+        total_loss.backward()
+        require_finite_gradients(model.parameters(), "Global multi-head CE")
+        optimizer.step()
+
+        prediction_logits = torch.stack([logits.detach() for logits in logits_by_head]).sum(
+            dim=0
+        )
+        correct += prediction_logits.argmax(dim=1).eq(labels).sum().item()
+
+    if total_samples == 0:
+        raise ValueError("The training loader is empty")
+    layer_losses = [value / total_samples for value in layer_loss_sums]
+    return {
+        "loss": statistics.mean(layer_losses),
+        "accuracy": correct / total_samples,
+        "layer_losses": layer_losses,
+    }
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -685,6 +835,10 @@ def train_one_epoch(
         return train_bp_epoch(model, loader, criterion, optimizers[0], device)
     if isinstance(model, LocalBPCNN):
         return train_local_bp_epoch(model, loader, criterion, optimizers, device)
+    if isinstance(model, GlobalMultiHeadCECNN):
+        return train_global_multihead_ce_epoch(
+            model, loader, criterion, optimizers[0], device
+        )
     raise TypeError(f"Unsupported model type: {type(model).__name__}")
 
 
@@ -816,7 +970,7 @@ def run_seed(
     model = build_model(config).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizers = build_optimizers(model, config)
-    schedulers = [CosineAnnealingLR(optimizer, T_max=config.epochs) for optimizer in optimizers]
+    schedulers = build_schedulers(optimizers, config)
 
     best_validation_accuracy = -1.0
     best_epoch = 0
@@ -889,6 +1043,21 @@ def run_seed(
             f"(epoch {best_epoch}) | peak train memory {memory_text} | "
             f"{train_seconds:.1f}s"
         )
+        if config.heartbeat_file:
+            write_json(
+                Path(config.heartbeat_file),
+                {
+                    "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "method": config.method,
+                    "dataset": config.dataset,
+                    "seed": seed,
+                    "epoch": epoch,
+                    "maximum_epochs": config.epochs,
+                    "best_epoch": best_epoch,
+                    "best_validation_accuracy": best_validation_accuracy,
+                    "epochs_without_improvement": epochs_without_improvement,
+                },
+            )
         if epochs_without_improvement >= config.patience:
             print(
                 f"Early stopping seed {seed} after epoch {epoch}: validation accuracy "
@@ -944,12 +1113,14 @@ def run_seed(
     if not best_checkpoint_restored:
         raise RuntimeError("Restored model state does not match the selected checkpoint")
 
-    # This is the only call that evaluates the official test split.
     test_evaluations = 0
-    test_accuracy = evaluate(model, test_loader, device)
-    test_evaluations += 1
-    if test_evaluations != 1 or not math.isfinite(test_accuracy):
-        raise RuntimeError("The official test split must produce one finite evaluation")
+    test_accuracy: float | None = None
+    if not config.defer_test:
+        # This is the only call that evaluates the official test split.
+        test_accuracy = evaluate(model, test_loader, device)
+        test_evaluations += 1
+        if test_evaluations != 1 or not math.isfinite(test_accuracy):
+            raise RuntimeError("The official test split must produce one finite evaluation")
     peak_mib = (
         peak_training_memory_bytes / (1024**2)
         if peak_training_memory_bytes is not None
@@ -964,7 +1135,7 @@ def run_seed(
         "optimizer_parameters": config.optimizer_parameters,
         "learning_rate": config.learning_rate,
         "scheduler": config.scheduler,
-        "scheduler_parameters": f"T_max={config.epochs},eta_min=0",
+        "scheduler_parameters": config.scheduler_parameters,
         "batch_size": config.batch_size,
         "eval_batch_size": config.eval_batch_size,
         "train_samples": len(train_loader.dataset),
@@ -1001,6 +1172,7 @@ def run_seed(
         "dropout": config.dropout,
         "weight_decay": config.weight_decay,
         "precision": config.precision,
+        "terminal_classifier_bias": config.terminal_classifier_bias,
         "backbone_widths": json.dumps(config.backbone_widths),
         "finite": True,
         "seed_started_at_utc": seed_started_at_utc,
@@ -1008,10 +1180,15 @@ def run_seed(
         "seed_wall_seconds": time.perf_counter() - seed_start,
     }
 
+    test_text = (
+        f"test {test_accuracy * 100:.2f}% (one evaluation) | "
+        if test_accuracy is not None
+        else "test deferred until profile selection | "
+    )
     print(
         f"[{config.method}][{config.dataset}][seed {seed}] selected epoch {best_epoch} | "
         f"validation {best_validation_accuracy * 100:.2f}% | "
-        f"test {test_accuracy * 100:.2f}% (one evaluation) | "
+        f"{test_text}"
         f"peak GPU training memory "
         f"{f'{peak_mib:.1f} MiB' if peak_mib is not None else 'n/a on CPU'}"
     )
@@ -1067,7 +1244,7 @@ def aggregate_results(seed_rows: list[dict[str, object]]) -> dict[str, object]:
         "peak_gpu_training_memory_mib_sample_std": memory_std,
         "train_epoch_seconds_mean": time_mean,
         "train_epoch_seconds_sample_std": time_std,
-        "test_evaluations_per_seed": 1,
+        "test_evaluations_per_seed": int(first["test_evaluations"]),
         "test_evaluation_policy": first["test_evaluation_policy"],
         "all_best_checkpoints_restored": all(
             bool(row["best_checkpoint_restored"]) for row in seed_rows
@@ -1076,6 +1253,7 @@ def aggregate_results(seed_rows: list[dict[str, object]]) -> dict[str, object]:
         "dropout": first["dropout"],
         "weight_decay": first["weight_decay"],
         "precision": first["precision"],
+        "terminal_classifier_bias": first["terminal_classifier_bias"],
         "backbone_widths": first["backbone_widths"],
         "all_finite": all(bool(row["finite"]) for row in seed_rows),
     }
@@ -1143,6 +1321,7 @@ SEED_RESULT_FIELDS = [
     "dropout",
     "weight_decay",
     "precision",
+    "terminal_classifier_bias",
     "backbone_widths",
     "finite",
     "seed_started_at_utc",
@@ -1183,6 +1362,7 @@ AGGREGATE_FIELDS = [
     "dropout",
     "weight_decay",
     "precision",
+    "terminal_classifier_bias",
     "backbone_widths",
     "all_finite",
 ]
@@ -1242,7 +1422,7 @@ def main(argv: list[str] | None = None) -> None:
         output_dir / "run_metadata.json",
         {
             "schema_version": 1,
-            "status": "complete",
+            "status": "train_complete" if config.defer_test else "complete",
             "started_at_utc": run_started_at_utc,
             "finished_at_utc": datetime.now(timezone.utc).isoformat(),
             "wall_seconds": time.perf_counter() - run_start,
@@ -1275,18 +1455,25 @@ def main(argv: list[str] | None = None) -> None:
         f"{float(aggregate['best_validation_accuracy_mean']) * 100:.2f}% ± "
         f"{float(aggregate['best_validation_accuracy_sample_std']) * 100:.2f}%"
     )
-    print(
-        "Test accuracy: "
-        f"{float(aggregate['test_accuracy_mean']) * 100:.2f}% ± "
-        f"{float(aggregate['test_accuracy_sample_std']) * 100:.2f}%"
-    )
+    if aggregate["test_accuracy_mean"] is None:
+        print("Test accuracy: deferred until optimizer-profile selection")
+    else:
+        print(
+            "Test accuracy: "
+            f"{float(aggregate['test_accuracy_mean']) * 100:.2f}% ± "
+            f"{float(aggregate['test_accuracy_sample_std']) * 100:.2f}%"
+        )
     memory_mean = aggregate["peak_gpu_training_memory_mib_mean"]
     memory_std = aggregate["peak_gpu_training_memory_mib_sample_std"]
     if memory_mean is not None and memory_std is not None:
         print(f"Peak GPU training memory: {float(memory_mean):.1f} ± {float(memory_std):.1f} MiB")
     else:
         print("Peak GPU training memory: not available for a non-CUDA run")
-    print("Official test evaluations: exactly one per seed")
+    print(
+        "Official test evaluations: deferred"
+        if config.defer_test
+        else "Official test evaluations: exactly one per seed"
+    )
     print(f"Results written to {output_dir.resolve()}")
 
 

@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use this code or its benchmark results, please cite the accompanying manuscript."
+title: "Disentangling Objective Design and Gradient Locality in Supervised Forward--Forward Learning"
+type: software
+version: 0.2.0
+authors:
+  - family-names: Gong
+    given-names: James
+  - family-names: Abdulla
+    given-names: Waleed
+repository-code: "https://github.com/HaoxuanGong/FF-Decomposition"

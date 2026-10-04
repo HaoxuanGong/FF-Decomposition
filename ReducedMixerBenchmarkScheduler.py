@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the reduced BP versus Local BP MLP-Mixer reference benchmark."""
+"""Run the paper's three matched cross-entropy MLP-Mixer baselines."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from MLPMixerBenchmarkSuite import (
 
 DATASETS = ("cifar10", "cifar100", "pathmnist", "tinyimagenet")
 MANIFEST_SCHEMA_VERSION = 2
-METHODS = ("bp", "local-bp")
+METHODS = ("bp", "local-bp", "ce-matched-ge")
 SEEDS = (424, 425, 426)
 PATCH_SIZES = {"cifar10": 4, "cifar100": 4, "pathmnist": 7, "tinyimagenet": 8}
 PAIR_MATCH_FIELDS = (
@@ -100,7 +100,7 @@ def file_sha256(path: Path) -> str:
 
 
 def jobs() -> list[tuple[str, int, str]]:
-    """Pair BP and Local BP adjacently for every dataset and seed."""
+    """Place all three matched CE controls adjacently by dataset and seed."""
 
     return [
         (dataset, seed, method)
@@ -158,10 +158,10 @@ def command_for(
         "0.05",
         "--momentum",
         "0.9",
-        "--token-ratio",
-        "1",
-        "--channel-ratio",
-        "4",
+        "--token-dim",
+        "256",
+        "--channel-dim",
+        "1024",
         "--local-bp-updates-per-block",
         "1",
         "--data-dir",
@@ -172,6 +172,8 @@ def command_for(
         "result.csv",
         "--summary-csv",
         "summary.csv",
+        "--heartbeat-file",
+        str(output_dir / "heartbeat.json"),
         "--checkpoint-dir",
         str(run_dir / "checkpoints"),
         "--device",
@@ -387,49 +389,54 @@ def aggregate(run_dir: Path) -> dict[str, Any]:
 
     paired_rows: list[dict[str, Any]] = []
     for dataset in DATASETS:
-        primary_deltas: list[float] = []
-        secondary_deltas: list[float] = []
-        memory_ratios: list[float] = []
-        for seed in SEEDS:
-            bp = indexed[(dataset, "bp", seed)]
-            local = indexed[(dataset, "local-bp", seed)]
-            for field in PAIR_MATCH_FIELDS:
-                if bp.get(field) != local.get(field):
+        for comparison_method in ("local-bp", "ce-matched-ge"):
+            primary_deltas: list[float] = []
+            secondary_deltas: list[float] = []
+            memory_ratios: list[float] = []
+            for seed in SEEDS:
+                bp = indexed[(dataset, "bp", seed)]
+                comparison = indexed[(dataset, comparison_method, seed)]
+                for field in PAIR_MATCH_FIELDS:
+                    if bp.get(field) != comparison.get(field):
+                        raise RuntimeError(
+                            f"Unmatched pair for {dataset}, seed {seed}: {field} differs"
+                        )
+                if _row_dataset_integrity(bp) != _row_dataset_integrity(comparison):
                     raise RuntimeError(
-                        f"Unmatched pair for {dataset}, seed {seed}: {field} differs"
+                        f"Unmatched dataset provenance for {dataset}, seed {seed}"
                     )
-            if _row_dataset_integrity(bp) != _row_dataset_integrity(local):
-                raise RuntimeError(
-                    f"Unmatched dataset provenance for {dataset}, seed {seed}"
+                primary_deltas.append(
+                    _as_float(comparison, "test_primary")
+                    - _as_float(bp, "test_primary")
                 )
-            primary_deltas.append(
-                _as_float(local, "test_primary") - _as_float(bp, "test_primary")
+                secondary_deltas.append(
+                    _as_float(comparison, "test_secondary")
+                    - _as_float(bp, "test_secondary")
+                )
+                memory_ratios.append(
+                    _as_float(comparison, "peak_train_mem_gb")
+                    / _as_float(bp, "peak_train_mem_gb")
+                )
+            primary_mean, primary_std = _mean_std(primary_deltas)
+            secondary_mean, secondary_std = _mean_std(secondary_deltas)
+            ratio_mean, ratio_std = _mean_std(memory_ratios)
+            paired_rows.append(
+                {
+                    "dataset": dataset,
+                    "comparison_method": comparison_method,
+                    "reference_method": "bp",
+                    "seeds": ",".join(map(str, SEEDS)),
+                    "comparison_minus_bp_primary_mean": primary_mean,
+                    "comparison_minus_bp_primary_sample_std": primary_std,
+                    "comparison_minus_bp_secondary_mean": secondary_mean,
+                    "comparison_minus_bp_secondary_sample_std": secondary_std,
+                    "comparison_over_bp_memory_mean": ratio_mean,
+                    "comparison_over_bp_memory_sample_std": ratio_std,
+                    "per_seed_primary_deltas": json.dumps(primary_deltas),
+                    "per_seed_secondary_deltas": json.dumps(secondary_deltas),
+                    "per_seed_memory_ratios": json.dumps(memory_ratios),
+                }
             )
-            secondary_deltas.append(
-                _as_float(local, "test_secondary") - _as_float(bp, "test_secondary")
-            )
-            memory_ratios.append(
-                _as_float(local, "peak_train_mem_gb")
-                / _as_float(bp, "peak_train_mem_gb")
-            )
-        primary_mean, primary_std = _mean_std(primary_deltas)
-        secondary_mean, secondary_std = _mean_std(secondary_deltas)
-        ratio_mean, ratio_std = _mean_std(memory_ratios)
-        paired_rows.append(
-            {
-                "dataset": dataset,
-                "seeds": ",".join(map(str, SEEDS)),
-                "local_minus_bp_primary_mean": primary_mean,
-                "local_minus_bp_primary_sample_std": primary_std,
-                "local_minus_bp_secondary_mean": secondary_mean,
-                "local_minus_bp_secondary_sample_std": secondary_std,
-                "local_over_bp_memory_mean": ratio_mean,
-                "local_over_bp_memory_sample_std": ratio_std,
-                "per_seed_primary_deltas": json.dumps(primary_deltas),
-                "per_seed_secondary_deltas": json.dumps(secondary_deltas),
-                "per_seed_memory_ratios": json.dumps(memory_ratios),
-            }
-        )
 
     method_csv = run_dir / "reduced_mixer_summary.csv"
     with method_csv.open("w", newline="", encoding="utf-8") as handle:
@@ -451,8 +458,8 @@ def aggregate(run_dir: Path) -> dict[str, Any]:
         "paired_rows": paired_rows,
         "pair_verification": (
             "backbone, data, split, optimization, hardware, and evaluation metadata "
-            "match within each seed; Local BP differs by local heads, local objectives, "
-            "gradient detachment, and summed-head inference"
+            "match within each seed; the three controls differ only in classifier/loss "
+            "placement, gradient routing, optimizer topology, and prediction rule"
         ),
     }
     atomic_json(run_dir / "reduced_mixer_summary.json", summary)
@@ -497,14 +504,25 @@ def prepare_run_directory(run_dir: Path, manifest: dict[str, Any]) -> bool:
                 "source",
                 "source_snapshot.sha256",
                 "scheduler.log",
+                "scheduler.pid",
             }
             if (
                 not entries.issubset(allowed_prelaunch_entries)
-                or not (run_dir / "source").is_dir()
-                or not (run_dir / "source_snapshot.sha256").is_file()
+                or (
+                    (run_dir / "source").exists()
+                    and not (run_dir / "source").is_dir()
+                )
+                or (
+                    (run_dir / "source_snapshot.sha256").exists()
+                    and not (run_dir / "source_snapshot.sha256").is_file()
+                )
                 or (
                     (run_dir / "scheduler.log").exists()
                     and not (run_dir / "scheduler.log").is_file()
+                )
+                or (
+                    (run_dir / "scheduler.pid").exists()
+                    and not (run_dir / "scheduler.pid").is_file()
                 )
             ):
                 raise RuntimeError(
@@ -576,7 +594,7 @@ def main() -> int:
         "python": args.python,
         "scheduler_environment": scheduler_environment(),
         "protocol": {
-            "purpose": "BP and Local BP reference benchmark; not a causal locality ablation",
+            "purpose": "Three matched cross-entropy reference baselines for the paper",
             "datasets": list(DATASETS),
             "methods": list(METHODS),
             "seeds": list(SEEDS),
@@ -595,7 +613,10 @@ def main() -> int:
             "early_stopping_patience": 15,
             "early_stopping_min_delta": 0.0,
             "checkpoint_selection": "strict validation-primary improvement",
-            "test_policy": "exactly once after best-checkpoint restoration",
+            "test_policy": (
+                "validation selects one best checkpoint within every fixed-profile run; "
+                "the official test split is then evaluated exactly once"
+            ),
             "optimizer": "AdamW",
             "learning_rate": 0.0003,
             "weight_decay": 0.05,
@@ -639,6 +660,16 @@ def main() -> int:
     }
     prepare_run_directory(run_dir, manifest)
     (run_dir / "logs").mkdir(exist_ok=True)
+    (run_dir / "scheduler.done").unlink(missing_ok=True)
+    (run_dir / "scheduler.failed").unlink(missing_ok=True)
+    atomic_json(
+        run_dir / "scheduler.running",
+        {
+            "status": "running",
+            "pid": os.getpid(),
+            "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
     completed = 0
     failures: list[dict[str, Any]] = []
@@ -654,6 +685,7 @@ def main() -> int:
                 "failed": len(failures),
                 "current_index": index,
                 "current": {"dataset": dataset, "method": method, "seed": seed},
+                "heartbeat": str(job_dir(run_dir, dataset, method, seed) / "heartbeat.json"),
                 "updated_at_utc": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -711,8 +743,12 @@ def main() -> int:
         "finished_at_utc": datetime.now(timezone.utc).isoformat(),
         "summary": summary,
     }
-    atomic_json(run_dir / "scheduler.done", final)
-    return 0 if not failures else 1
+    code = 0 if not failures else 1
+    terminal_state = "scheduler.done" if code == 0 else "scheduler.failed"
+    atomic_json(run_dir / terminal_state, final)
+    (run_dir / "scheduler.exit_code").write_text(f"{code}\n", encoding="utf-8")
+    (run_dir / "scheduler.running").unlink(missing_ok=True)
+    return code
 
 
 if __name__ == "__main__":

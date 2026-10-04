@@ -23,7 +23,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.optim import Adam, SGD
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
 from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset
 import torchvision
 from torchvision.datasets import CIFAR10, CIFAR100, FashionMNIST, MNIST
@@ -49,31 +49,35 @@ from decomposition_core import (
 )
 
 
-METHODS = (
-    "bp",
-    "local-bp",
-    "ce-matched-local",
-    "ce-matched-ge",
+PRIMARY_METHODS = (
     "ff",
-    "ff-ge",
-    "ff-matched-local",
     "ff-matched-ge",
+    "ff-ge",
+    "nn-ff-ge",
     "fc-ff",
+    "fc-ff-matched-ge",
     "fc-ff-ge",
     "fc-nn-ff-ge",
+    "local-bp",
+    "ce-matched-ge",
+    "bp",
 )
+COMPATIBILITY_METHODS = ("ff-matched-local", "ce-matched-local")
+METHODS = PRIMARY_METHODS + COMPATIBILITY_METHODS
 METHOD_LABELS = {
-    "bp": "BP",
-    "local-bp": "Local BP",
-    "ce-matched-local": "Matched CE (local)",
-    "ce-matched-ge": "Matched CE (global)",
-    "ff": "Vanilla FF",
-    "ff-ge": "FF + GE",
-    "ff-matched-local": "Matched FF (local)",
-    "ff-matched-ge": "Matched FF (global)",
-    "fc-ff": "FC-FF",
-    "fc-ff-ge": "FC-FF + GE",
-    "fc-nn-ff-ge": "FC-NN-FF + GE",
+    "ff": "Vanilla FF (Local, Multi-Head)",
+    "ff-matched-ge": "FF (Global, Multi-Head)",
+    "ff-ge": "FF (Global, Terminal)",
+    "nn-ff-ge": "NN-FF (Global, Terminal)",
+    "fc-ff": "FC-FF (Local, Multi-Head)",
+    "fc-ff-matched-ge": "FC-FF (Global, Multi-Head)",
+    "fc-ff-ge": "FC-FF (Global, Terminal)",
+    "fc-nn-ff-ge": "FC-NN-FF (Global, Terminal)",
+    "local-bp": "CE (Local, Multi-Head)",
+    "ce-matched-ge": "CE (Global, Multi-Head)",
+    "bp": "CE (Global, Terminal)",
+    "ff-matched-local": "Matched FF (Local, Multi-Head; compatibility control)",
+    "ce-matched-local": "Matched CE (Local, Multi-Head; compatibility control)",
 }
 DATASETS = ("mnist", "fashionmnist", "cifar10", "cifar100")
 DATASET_LABELS = {
@@ -89,16 +93,19 @@ ARCHITECTURES = {
     "cifar10": (2000, 2000, 2000),
     "cifar100": (2000, 2000, 2000),
 }
-FC_METHODS = {"fc-ff", "fc-ff-ge", "fc-nn-ff-ge"}
+FC_METHODS = {"fc-ff", "fc-ff-matched-ge", "fc-ff-ge", "fc-nn-ff-ge"}
 MATCHED_FF_METHODS = {"ff-matched-local", "ff-matched-ge"}
+THRESHOLDED_FF_METHODS = {"ff", "ff-ge", "nn-ff-ge"} | MATCHED_FF_METHODS
 MATCHED_CE_METHODS = {"ce-matched-local", "ce-matched-ge"}
 MATCHED_LOCALITY_METHODS = MATCHED_FF_METHODS | MATCHED_CE_METHODS
+NO_INTER_LAYER_NORMALIZATION_METHODS = {"nn-ff-ge", "fc-nn-ff-ge"}
 NORMALIZED_FF_METHODS = {
     "ff",
     "ff-ge",
     "ff-matched-local",
     "ff-matched-ge",
     "fc-ff",
+    "fc-ff-matched-ge",
     "fc-ff-ge",
 }
 DEFAULT_BATCH_SIZE = 128
@@ -106,7 +113,7 @@ DEFAULT_LEARNING_RATE = 1e-3
 DEFAULT_EPOCHS = 200
 DEFAULT_VALIDATION_SIZE = 5000
 DEFAULT_PATIENCE = 15
-DEFAULT_STEP_SIZE = 20
+DEFAULT_STEP_SIZE = 30
 DEFAULT_STEP_GAMMA = 0.1
 
 
@@ -359,7 +366,7 @@ def build_model(
         hidden_dims=resolved_hidden_dims,
         normalize=method in NORMALIZED_FF_METHODS,
         normalize_first_layer_input=(
-            method in NORMALIZED_FF_METHODS | {"fc-nn-ff-ge"}
+            method in NORMALIZED_FF_METHODS | NO_INTER_LAYER_NORMALIZATION_METHODS
         ),
     )
 
@@ -410,6 +417,66 @@ def train_local_full_comparison_epoch(
             optimizer.step()
             total_loss += loss.item() * labels.size(0)
             observations += labels.size(0)
+    return total_loss / observations
+
+
+def full_comparison_layer_scores(
+    model: GoodnessMLP,
+    inputs: torch.Tensor,
+    *,
+    num_classes: int,
+    candidate_chunk: int,
+    detach_between_layers: bool,
+) -> list[torch.Tensor]:
+    """Return one all-class goodness matrix per hidden layer.
+
+    Each result has shape ``[batch, classes]``.  Detachment changes only the
+    backward graph; it leaves the class-conditioned forward scores unchanged.
+    """
+    layer_chunks: list[list[torch.Tensor]] = [[] for _ in model.layers]
+    for start in range(0, num_classes, candidate_chunk):
+        stop = min(start + candidate_chunk, num_classes)
+        marked, count = expand_candidates(inputs, num_classes, start, stop)
+        for layer_index in range(len(model.layers)):
+            if layer_index > 0 and detach_between_layers:
+                marked = marked.detach()
+            marked = model.forward_layer(marked, layer_index)
+            goodness = model.activation_goodness(marked)
+            layer_chunks[layer_index].append(goodness.view(inputs.size(0), count))
+    return [torch.cat(chunks, dim=1) for chunks in layer_chunks]
+
+
+def train_global_multihead_full_comparison_epoch(
+    model: GoodnessMLP,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    *,
+    device: torch.device,
+    num_classes: int,
+    candidate_chunk: int,
+) -> float:
+    """Train globally connected FC-FF with one goodness objective per layer."""
+    model.train()
+    total_loss = 0.0
+    observations = 0
+    for inputs, labels in loader:
+        inputs = inputs.to(device, non_blocking=device.type == "cuda")
+        labels = labels.to(device, non_blocking=device.type == "cuda")
+        layer_scores = full_comparison_layer_scores(
+            model,
+            inputs,
+            num_classes=num_classes,
+            candidate_chunk=candidate_chunk,
+            detach_between_layers=False,
+        )
+        loss = torch.stack(
+            [F.cross_entropy(scores, labels) for scores in layer_scores]
+        ).mean()
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * labels.size(0)
+        observations += labels.size(0)
     return total_loss / observations
 
 
@@ -520,6 +587,39 @@ def validate_optimizer_coverage(
         raise RuntimeError("A trainable parameter appears in more than one optimizer")
 
 
+def make_schedulers(
+    optimizers: Sequence[torch.optim.Optimizer],
+    *,
+    scheduler_name: str,
+    epochs: int,
+    step_size: int,
+    step_gamma: float,
+) -> list[Any]:
+    """Create one scheduler per optimizer; callers step them once per epoch."""
+    if scheduler_name == "none":
+        return []
+    if scheduler_name == "step":
+        return [StepLR(optimizer, step_size=step_size, gamma=step_gamma) for optimizer in optimizers]
+    if scheduler_name == "cosine":
+        return [CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0.0) for optimizer in optimizers]
+    raise ValueError(f"Unsupported scheduler: {scheduler_name}")
+
+
+def positive_goodness_threshold(value: str) -> float:
+    threshold = float(value)
+    if not math.isfinite(threshold) or threshold <= 0:
+        raise argparse.ArgumentTypeError("--goodness-threshold must be finite and positive")
+    return threshold
+
+
+def validate_goodness_threshold(method: str, threshold: float) -> float:
+    if not math.isfinite(threshold) or threshold <= 0:
+        raise ValueError("--goodness-threshold must be finite and positive")
+    if method not in THRESHOLDED_FF_METHODS and threshold != GOODNESS_THRESHOLD:
+        raise ValueError(f"--goodness-threshold does not apply to method {method!r}")
+    return threshold
+
+
 def train_epoch(
     method: str,
     model: nn.Module,
@@ -529,7 +629,9 @@ def train_epoch(
     device: torch.device,
     num_classes: int,
     candidate_chunk: int,
+    goodness_threshold: float = GOODNESS_THRESHOLD,
 ) -> float:
+    goodness_threshold = validate_goodness_threshold(method, goodness_threshold)
     if method == "bp":
         return train_backprop_epoch(model, loader, optimizers[0], device=device)  # type: ignore[arg-type]
     if method == "local-bp":
@@ -544,11 +646,13 @@ def train_epoch(
         )
     if method == "ff":
         return train_vanilla_ff_epoch(
-            model, loader, optimizers, device=device, num_classes=num_classes  # type: ignore[arg-type]
+            model, loader, optimizers, device=device, num_classes=num_classes,  # type: ignore[arg-type]
+            threshold=goodness_threshold,
         )
-    if method == "ff-ge":
+    if method in {"ff-ge", "nn-ff-ge"}:
         return train_pairwise_global_epoch(
-            model, loader, optimizers[0], device=device, num_classes=num_classes  # type: ignore[arg-type]
+            model, loader, optimizers[0], device=device, num_classes=num_classes,  # type: ignore[arg-type]
+            threshold=goodness_threshold,
         )
     if method in {"ff-matched-local", "ff-matched-ge"}:
         return train_matched_ff_epoch(
@@ -558,12 +662,22 @@ def train_epoch(
             device=device,
             num_classes=num_classes,
             detach_between_layers=method == "ff-matched-local",
+            threshold=goodness_threshold,
         )
     if method == "fc-ff":
         return train_local_full_comparison_epoch(
             model,  # type: ignore[arg-type]
             loader,
             optimizers,
+            device=device,
+            num_classes=num_classes,
+            candidate_chunk=candidate_chunk,
+        )
+    if method == "fc-ff-matched-ge":
+        return train_global_multihead_full_comparison_epoch(
+            model,  # type: ignore[arg-type]
+            loader,
+            optimizers[0],
             device=device,
             num_classes=num_classes,
             candidate_chunk=candidate_chunk,
@@ -606,7 +720,7 @@ def evaluate(
         else:
             aggregation = (
                 "final"
-                if method in {"ff-ge", "fc-ff-ge", "fc-nn-ff-ge"}
+                if method in {"ff-ge", "nn-ff-ge", "fc-ff-ge", "fc-nn-ff-ge"}
                 else "sum"
             )
             scores = candidate_goodness(
@@ -630,16 +744,19 @@ def evaluate(
 
 
 def configuration(args: argparse.Namespace) -> dict[str, Any]:
+    goodness_threshold = validate_goodness_threshold(
+        args.method, getattr(args, "goodness_threshold", GOODNESS_THRESHOLD)
+    )
     local_schedule = (
         "all local layers updated per minibatch with detached representations"
         if args.method == "local-bp"
         else "one complete dataset pass per layer per nominal epoch"
         if args.method in {"ff", "fc-ff"}
         else "one matched multi-loss update per minibatch"
-        if args.method in MATCHED_LOCALITY_METHODS
+        if args.method in MATCHED_LOCALITY_METHODS | {"fc-ff-matched-ge"}
         else "one end-to-end update per minibatch"
     )
-    return {
+    config = {
         "dataset": args.dataset,
         "method": args.method,
         "seed": args.seed,
@@ -673,37 +790,44 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
         "validation_size": args.validation_size,
         "validation_split": "seeded stratified holdout from the original training split",
         "model_selection": "restore the checkpoint with the highest validation accuracy",
-        "test_policy": "one evaluation after restoring the best validation checkpoint",
+        "test_policy": (
+            "deferred until a separate evaluation after validation-only configuration selection"
+            if args.defer_test
+            else "one evaluation after restoring the best validation checkpoint"
+        ),
         "local_update_schedule": local_schedule,
         "inter_layer_normalization": args.method in NORMALIZED_FF_METHODS,
         "first_layer_input_normalization": (
-            args.method in NORMALIZED_FF_METHODS | {"fc-nn-ff-ge"}
+            args.method in NORMALIZED_FF_METHODS | NO_INTER_LAYER_NORMALIZATION_METHODS
         ),
         "normalization_scope": (
             "input to every FF layer, including the encoded input to layer 1"
             if args.method in NORMALIZED_FF_METHODS
             else "encoded input to layer 1 only"
-            if args.method == "fc-nn-ff-ge"
+            if args.method in NO_INTER_LAYER_NORMALIZATION_METHODS
             else "none"
         ),
         "normalization_epsilon": (
             NORMALIZATION_EPSILON
-            if args.method in NORMALIZED_FF_METHODS | {"fc-nn-ff-ge"}
+            if args.method in NORMALIZED_FF_METHODS | NO_INTER_LAYER_NORMALIZATION_METHODS
             else None
         ),
         "goodness_definition": (
-            None if args.method in MATCHED_CE_METHODS else "mean squared activation"
+            None
+            if args.method in {"bp", "local-bp"} | MATCHED_CE_METHODS
+            else "mean squared activation"
         ),
         "goodness_threshold": (
-            GOODNESS_THRESHOLD
-            if args.method
-            in {"ff", "ff-ge", "ff-matched-local", "ff-matched-ge"}
+            goodness_threshold
+            if args.method in THRESHOLDED_FF_METHODS
             else None
         ),
         "matched_locality_control": args.method in MATCHED_LOCALITY_METHODS,
         "matched_loss_placement": (
             "equal-weight mean of one thresholded FF loss at every layer"
             if args.method in MATCHED_FF_METHODS
+            else "equal-weight mean of one all-class goodness loss at every layer"
+            if args.method == "fc-ff-matched-ge"
             else "equal-weight mean of one cross-entropy loss at every layer"
             if args.method in MATCHED_CE_METHODS
             else None
@@ -711,18 +835,23 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
         "detach_between_layers": (
             args.method in {"ff-matched-local", "ce-matched-local"}
             if args.method in MATCHED_LOCALITY_METHODS
+            else True
+            if args.method == "local-bp"
+            else False
+            if args.method == "fc-ff-matched-ge"
             else None
         ),
         "prediction": (
             "cumulative local logits"
             if args.method == "local-bp" or args.method in MATCHED_CE_METHODS
             else "final-layer goodness"
-            if args.method in {"ff-ge", "fc-ff-ge", "fc-nn-ff-ge"}
+            if args.method in {"ff-ge", "nn-ff-ge", "fc-ff-ge", "fc-nn-ff-ge"}
             else "summed layer goodness"
             if args.method
-            in {"ff", "ff-matched-local", "ff-matched-ge", "fc-ff"}
+            in {"ff", "ff-matched-local", "ff-matched-ge", "fc-ff", "fc-ff-matched-ge"}
             else "classifier logits"
         ),
+        "terminal_classifier_bias": False if args.method == "bp" else None,
         "candidate_chunk": args.candidate_chunk,
         "num_workers": args.num_workers,
         "download": args.download,
@@ -732,6 +861,7 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
             if args.method in {
                 "ff",
                 "ff-ge",
+                "nn-ff-ge",
                 "ff-matched-local",
                 "ff-matched-ge",
             }
@@ -741,13 +871,23 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "label_encoding": (
             "replace the first C normalized input entries with a 0/1 one-hot label"
-            if args.method in NORMALIZED_FF_METHODS | {"fc-nn-ff-ge"}
+            if args.method in NORMALIZED_FF_METHODS | NO_INTER_LAYER_NORMALIZATION_METHODS
             else None
         ),
         "dnc_policy": "report every finite completed accuracy numerically; DNC only on run failure",
         "train_limit": args.train_limit,
         "test_limit": args.test_limit,
     }
+    if args.defer_test or args.scheduler == "cosine":
+        config.update(
+            {
+                "cosine_t_max": args.epochs if args.scheduler == "cosine" else None,
+                "cosine_eta_min": 0.0 if args.scheduler == "cosine" else None,
+                "scheduler_step_unit": "one step after each nominal training epoch",
+                "defer_test": args.defer_test,
+            }
+        )
+    return config
 
 
 def run(args: argparse.Namespace) -> None:
@@ -761,6 +901,9 @@ def run(args: argparse.Namespace) -> None:
         existing = json.loads(result_path.read_text(encoding="utf-8"))
         if existing.get("config") != config:
             raise RuntimeError(f"Existing result uses a different configuration: {result_path}")
+        allowed_statuses = {"train_complete", "complete"} if args.defer_test else {"complete"}
+        if existing.get("status") not in allowed_statuses:
+            raise RuntimeError(f"Existing run is not complete: {result_path}")
         print(f"REUSE {result_path}", flush=True)
         return
     if run_dir.exists() and any(run_dir.iterdir()):
@@ -797,13 +940,12 @@ def run(args: argparse.Namespace) -> None:
         momentum=args.momentum,
     )
     validate_optimizer_coverage(model, optimizers)
-    schedulers = (
-        [
-            StepLR(optimizer, step_size=args.step_size, gamma=args.step_gamma)
-            for optimizer in optimizers
-        ]
-        if args.scheduler == "step"
-        else []
+    schedulers = make_schedulers(
+        optimizers,
+        scheduler_name=args.scheduler,
+        epochs=args.epochs,
+        step_size=args.step_size,
+        step_gamma=args.step_gamma,
     )
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -827,6 +969,7 @@ def run(args: argparse.Namespace) -> None:
             device=device,
             num_classes=num_classes,
             candidate_chunk=args.candidate_chunk,
+            goodness_threshold=getattr(args, "goodness_threshold", GOODNESS_THRESHOLD),
         )
         if not math.isfinite(loss):
             raise FloatingPointError(f"Non-finite training loss at epoch {epoch}: {loss}")
@@ -902,6 +1045,15 @@ def run(args: argparse.Namespace) -> None:
         )
         for scheduler in schedulers:
             scheduler.step()
+        atomic_json(
+            run_dir / "heartbeat.json",
+            {
+                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "epoch": epoch,
+                "validation_accuracy": validation_accuracy,
+                "best_validation_accuracy": best_validation_accuracy,
+            },
+        )
         if (
             epoch >= args.minimum_epochs
             and epochs_without_improvement >= args.patience
@@ -916,17 +1068,19 @@ def run(args: argparse.Namespace) -> None:
     except TypeError:
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(checkpoint["state_dict"], strict=True)
-    test_metrics = evaluate(
-        args.method,
-        model,
-        test_loader,
-        device=device,
-        num_classes=num_classes,
-        candidate_chunk=args.candidate_chunk,
-    )
+    test_metrics = None
+    if not args.defer_test:
+        test_metrics = evaluate(
+            args.method,
+            model,
+            test_loader,
+            device=device,
+            num_classes=num_classes,
+            candidate_chunk=args.candidate_chunk,
+        )
     result = {
-        "schema_version": 1,
-        "status": "complete",
+        "schema_version": 2,
+        "status": "train_complete" if args.defer_test else "complete",
         "config": config,
         "dataset": {
             "name": DATASET_LABELS[args.dataset],
@@ -951,7 +1105,7 @@ def run(args: argparse.Namespace) -> None:
             "best_validation_metrics": best_validation_metrics,
         },
         "test": test_metrics,
-        "test_evaluations": 1,
+        "test_evaluations": 0 if args.defer_test else 1,
         "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
         "elapsed_seconds": time.perf_counter() - started,
         "started_at_utc": started_at,
@@ -966,10 +1120,25 @@ def run(args: argparse.Namespace) -> None:
             "pytorch": torch.__version__,
             "torchvision": torchvision.__version__,
             "cuda_runtime": torch.version.cuda,
+            "cuda_arch_list": torch.cuda.get_arch_list(),
+            "cudnn": torch.backends.cudnn.version(),
+        },
+        "numerics": {
+            "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
+            "cudnn_deterministic": torch.backends.cudnn.deterministic,
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
         },
         "hardware": {
             "device": str(device),
             "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+            "cuda_capability": list(torch.cuda.get_device_capability(device)) if device.type == "cuda" else None,
+        },
+        "source_sha256": {
+            name: file_digest(Path(__file__).resolve().with_name(name), "sha256")
+            for name in ("MLPBenchmarkSuite.py", "decomposition_core.py")
         },
         "command": [sys.executable, *sys.argv],
     }
@@ -977,14 +1146,14 @@ def run(args: argparse.Namespace) -> None:
     print(
         f"FINAL {args.dataset} {args.method} seed={args.seed}: "
         f"best_epoch={best_epoch} val={best_validation_accuracy:.2f}% "
-        f"test={float(test_metrics['accuracy']):.2f}%",
+        + ("test=DEFERRED" if test_metrics is None else f"test={float(test_metrics['accuracy']):.2f}%"),
         flush=True,
     )
 
 
 def expected_matrix() -> list[tuple[str, str, int]]:
     jobs = []
-    for method in METHODS:
+    for method in PRIMARY_METHODS:
         for dataset in DATASETS:
             if dataset == "cifar100" and method in FC_METHODS:
                 continue
@@ -1112,8 +1281,8 @@ def self_test(_args: argparse.Namespace) -> None:
     )
     validate_optimizer_coverage(tiny_fc, tiny_optimizers)
 
-    if len(expected_matrix()) != 123:
-        raise RuntimeError("Expected experiment matrix must contain 123 seed-runs")
+    if len(expected_matrix()) != 120:
+        raise RuntimeError("Expected eleven-variant experiment matrix must contain 120 seed-runs")
     if any(dataset == "cifar100" and method in FC_METHODS for dataset, method, _ in expected_matrix()):
         raise RuntimeError("FC CIFAR-100 jobs leaked into the matrix")
     print(
@@ -1177,7 +1346,7 @@ def aggregate(args: argparse.Namespace) -> None:
         grouped.setdefault((method, dataset), []).append(payload)
 
     rows = []
-    for method in METHODS:
+    for method in PRIMARY_METHODS:
         row: dict[str, Any] = {"method": method, "method_label": METHOD_LABELS[method]}
         for dataset in DATASETS:
             key = (method, dataset)
@@ -1363,9 +1532,15 @@ def parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--validation-size", type=int, default=DEFAULT_VALIDATION_SIZE)
     run_parser.add_argument("--optimizer", choices=("adam", "sgd"), default="adam")
     run_parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
+    run_parser.add_argument(
+        "--goodness-threshold",
+        type=positive_goodness_threshold,
+        default=GOODNESS_THRESHOLD,
+        help="positive FF goodness threshold; applies to vanilla, global, and matched FF",
+    )
     run_parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     run_parser.add_argument("--momentum", type=float, default=0.9)
-    run_parser.add_argument("--scheduler", choices=("none", "step"), default="none")
+    run_parser.add_argument("--scheduler", choices=("none", "step", "cosine"), default="none")
     run_parser.add_argument("--step-size", type=int, default=DEFAULT_STEP_SIZE)
     run_parser.add_argument("--step-gamma", type=float, default=DEFAULT_STEP_GAMMA)
     run_parser.add_argument("--data-dir", type=Path, default=Path("data"))
@@ -1375,6 +1550,11 @@ def parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--candidate-chunk", type=int, default=10)
     run_parser.add_argument("--num-workers", type=int, default=0)
     run_parser.add_argument("--download", action=argparse.BooleanOptionalAction, default=False)
+    run_parser.add_argument(
+        "--defer-test",
+        action="store_true",
+        help="save the validation-selected model without evaluating the test split",
+    )
     run_parser.add_argument("--train-limit", type=int, default=None, help=argparse.SUPPRESS)
     run_parser.add_argument("--test-limit", type=int, default=None, help=argparse.SUPPRESS)
     run_parser.set_defaults(function=run)

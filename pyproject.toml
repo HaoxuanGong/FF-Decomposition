@@ -4,9 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ff-decomposition-experiments"
-version = "0.1.0"
+version = "0.2.0"
 description = "Reproducible experiments for decomposing supervised Forward-Forward learning"
+readme = "README.md"
 requires-python = ">=3.10"
+authors = [
+    {name = "James Gong"},
+    {name = "Waleed Abdulla"},
+]
+keywords = [
+    "forward-forward",
+    "local learning",
+    "credit assignment",
+    "deep learning",
+]
 dependencies = [
     "medmnist>=3.0",
     "matplotlib>=3.7",
@@ -20,34 +31,58 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7", "ruff>=0.5"]
 
+[project.urls]
+Repository = "https://github.com/HaoxuanGong/FF-Decomposition"
+Issues = "https://github.com/HaoxuanGong/FF-Decomposition/issues"
+
 [project.scripts]
+ff-download-data = "DatasetBootstrap:main"
 ff-decomposition-mlp = "MLPBenchmarkSuite:main"
-broad-mlp-benchmark = "BroadMLPBenchmarkScheduler:main"
-ff-matched-control = "MatchedLocalityControlScheduler:main"
-ce-matched-control = "MatchedCELocalityControlScheduler:main"
-ff-normalization-ablation = "NormalizationAblationScheduler:main"
-local-bp-cnn = "LocalBPCNNBenchmark:main"
-matched-cnn-local-bp = "MatchedCNNLocalBPBenchmarkScheduler:main"
-local-bp-mixer = "MLPMixerBenchmarkSuite:main"
-reduced-local-bp-mixer = "ReducedMixerBenchmarkScheduler:main"
-ff-reconstruction-probe = "ReconstructionProbe:main"
-ff-reconstruction-experiment = "ReconstructionExperimentScheduler:main"
+paper-mlp-threshold-sweep = "MLPThresholdSweepScheduler:main"
+paper-mlp-sweep = "MLPOptimizerSweepScheduler:main"
+ff-decomposition-cnn = "LocalBPCNNBenchmark:main"
+paper-cnn-sweep = "CNNOptimizerSweepScheduler:main"
+ff-decomposition-mixer = "MLPMixerBenchmarkSuite:main"
+paper-mixer-benchmark = "ReducedMixerBenchmarkScheduler:main"
 
 [tool.setuptools]
 py-modules = [
+    "DatasetBootstrap",
     "decomposition_core",
     "MLPBenchmarkSuite",
+    "MLPThresholdSweepScheduler",
+    "MLPOptimizerSweepScheduler",
     "BroadMLPBenchmarkScheduler",
     "MatchedLocalityControlScheduler",
     "MatchedCELocalityControlScheduler",
     "NormalizationAblationScheduler",
     "LocalBPCNNBenchmark",
+    "CNNOptimizerSweepScheduler",
     "MatchedCNNLocalBPBenchmarkScheduler",
     "medmnist_support",
     "MLPMixerBenchmarkSuite",
     "ReducedMixerBenchmarkScheduler",
     "ReconstructionProbe",
     "ReconstructionExperimentScheduler",
+]
+
+[tool.setuptools.data-files]
+"share/ff-decomposition" = [
+    "CITATION.cff",
+    "environment.yml",
+    "requirements.txt",
+]
+"share/ff-decomposition/configs" = ["configs/paper_protocol.json"]
+"share/ff-decomposition/docs" = [
+    "docs/PAPER_PROTOCOL.md",
+    "docs/RELEASE_CHECKLIST.md",
+]
+"share/ff-decomposition/paper_results" = [
+    "paper_results/PROVENANCE.md",
+    "paper_results/README.md",
+    "paper_results/per_seed_provenance.csv",
+    "paper_results/reported_accuracy.csv",
+    "paper_results/unsupported_reported_rows.csv",
 ]
 
 [tool.pytest.ini_options]

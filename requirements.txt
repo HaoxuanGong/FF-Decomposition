@@ -1,3 +1,4 @@
+# Minimum compatible dependencies. See environment.yml for the tested GPU stack.
 medmnist>=3.0
 matplotlib>=3.7
 numpy>=1.24

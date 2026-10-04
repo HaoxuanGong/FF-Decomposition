@@ -12,6 +12,7 @@ import LocalBPCNNBenchmark as cnn
 
 from LocalBPCNNBenchmark import (
     BPCNN,
+    GlobalMultiHeadCECNN,
     LocalBPCNN,
     build_optimizer,
     parse_args,
@@ -55,6 +56,31 @@ def test_cnn_last_local_loss_is_isolated_from_all_earlier_blocks() -> None:
     assert any(parameter.grad is not None for parameter in model.heads[-1].parameters())
 
 
+def test_cnn_global_multihead_last_loss_updates_all_earlier_blocks() -> None:
+    model = GlobalMultiHeadCECNN(3, 10)
+    images = torch.randn(2, 3, 32, 32)
+    labels = torch.tensor([0, 1])
+    logits = model.forward_heads(images)
+    F.cross_entropy(logits[-1], labels).backward()
+    for block in model.blocks:
+        assert any(parameter.grad is not None for parameter in block.parameters())
+    assert all(parameter.grad is None for head in model.heads[:-1] for parameter in head.parameters())
+    assert any(parameter.grad is not None for parameter in model.heads[-1].parameters())
+
+
+def test_cnn_local_and_global_multihead_are_exactly_matched_at_initialization() -> None:
+    torch.manual_seed(424)
+    local = LocalBPCNN(3, 10)
+    torch.manual_seed(424)
+    global_multihead = GlobalMultiHeadCECNN(3, 10)
+    for local_parameter, global_parameter in zip(
+        local.parameters(), global_multihead.parameters(), strict=True
+    ):
+        assert torch.equal(local_parameter, global_parameter)
+    images = torch.randn(2, 3, 32, 32)
+    assert torch.equal(local(images), global_multihead(images))
+
+
 def test_cnn_bp_and_local_bp_start_with_the_same_backbone_for_a_seed() -> None:
     torch.manual_seed(424)
     bp = BPCNN(3, 10)
@@ -72,8 +98,11 @@ def test_cnn_fixed_defaults_match_the_paper_protocol() -> None:
     assert args.patience == 15
     assert args.minimum_delta == 0.0
     assert args.validation_size == 5000
-    assert args.optimizer == "sgd"
-    assert args.learning_rate == 0.1
+    assert args.optimizer == "adam"
+    assert args.learning_rate == 0.001
+    assert args.scheduler == "cosine"
+    assert args.step_size == 30
+    assert args.step_gamma == 0.1
     assert args.batch_size == 128
     assert args.eval_batch_size == 512
     assert args.seeds == [424, 425, 426]
@@ -114,6 +143,9 @@ def test_cnn_run_persists_and_restores_hashed_best_checkpoint(
         optimizer_parameters="momentum=0.9,dampening=0,nesterov=false",
         learning_rate=0.1,
         scheduler="cosine-annealing",
+        scheduler_parameters="T_max=2,eta_min=0",
+        step_size=30,
+        step_gamma=0.1,
         batch_size=2,
         eval_batch_size=2,
         seeds=[7],
@@ -125,6 +157,8 @@ def test_cnn_run_persists_and_restores_hashed_best_checkpoint(
         save_checkpoints=True,
         provenance_run_id="unit-test",
         overwrite=False,
+        defer_test=False,
+        heartbeat_file="",
         backbone_widths=(2, 2, 2, 2),
     )
     _history, result = cnn.run_seed(

@@ -12,6 +12,7 @@ from decomposition_core import (
     matched_ff_layer_losses,
     sample_wrong_labels,
 )
+from MLPBenchmarkSuite import full_comparison_layer_scores
 
 
 def test_goodness_is_mean_squared_activation() -> None:
@@ -109,6 +110,42 @@ def test_matched_ff_pair_differs_only_in_gradient_connectivity() -> None:
         for local_loss, global_loss in zip(local_losses, global_losses, strict=True)
     )
     global_losses[-1].backward()
+    assert all(layer.weight.grad is not None for layer in global_model.layers)
+
+
+def test_global_multihead_full_comparison_preserves_scores_and_global_credit() -> None:
+    torch.manual_seed(29)
+    inputs = torch.randn(6, 16)
+    labels = torch.arange(6) % 4
+    local_model = GoodnessMLP(16, hidden_dims=(8, 8), normalize=True)
+    global_model = GoodnessMLP(16, hidden_dims=(8, 8), normalize=True)
+    global_model.load_state_dict(local_model.state_dict())
+
+    local_scores = full_comparison_layer_scores(
+        local_model,
+        inputs,
+        num_classes=4,
+        candidate_chunk=2,
+        detach_between_layers=True,
+    )
+    global_scores = full_comparison_layer_scores(
+        global_model,
+        inputs,
+        num_classes=4,
+        candidate_chunk=2,
+        detach_between_layers=False,
+    )
+    assert all(scores.shape == (6, 4) for scores in global_scores)
+    assert all(
+        torch.equal(local.detach(), global_.detach())
+        for local, global_ in zip(local_scores, global_scores, strict=True)
+    )
+
+    F.cross_entropy(local_scores[-1], labels).backward()
+    assert local_model.layers[0].weight.grad is None
+    assert local_model.layers[1].weight.grad is not None
+
+    F.cross_entropy(global_scores[-1], labels).backward()
     assert all(layer.weight.grad is not None for layer in global_model.layers)
 
 

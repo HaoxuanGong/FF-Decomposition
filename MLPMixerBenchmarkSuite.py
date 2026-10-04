@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the paper's matched backpropagation and Local BP MLP-Mixer sweep."""
+"""Run the paper's cross-entropy MLP-Mixer benchmark suite."""
 
 import argparse
 import csv
@@ -44,9 +44,9 @@ COIL_URL = "https://www.cs.columbia.edu/CAVE/databases/SLAM_coil-20_coil-100/coi
 TINY_REFERENCE_URL = "https://cs231n.stanford.edu/2016/project.html"
 COIL_REFERENCE_URL = "https://cave.cs.columbia.edu/repository/COIL-100"
 MAIN_DATASETS = ("cifar10", "cifar100", "tinyimagenet", "coil100", *MEDMNIST_DATASETS)
-PAPER_SEEDS = (41, 42, 43)
-PAPER_DEPTHS = (5, 8, 12)
-PAPER_DIMS = (256, 512)
+PAPER_SEEDS = (424, 425, 426)
+PAPER_DEPTHS = (5,)
+PAPER_DIMS = (256,)
 MIXER_DROPOUT = 0.1
 SCHEDULER_NAME = "cosine_annealing"
 RESULT_SCHEMA_VERSION = 2
@@ -108,6 +108,7 @@ SUMMARY_GROUP_FIELDS = (
     "validation_fraction",
     "validation_is_official",
     "dropout",
+    "terminal_classifier_bias",
     "scheduler",
     "scheduler_t_max",
     "local_bp_updates_per_block",
@@ -140,7 +141,7 @@ SUMMARY_METRICS = (
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser("MLP-Mixer BP vs Local BP benchmark suite")
+    parser = argparse.ArgumentParser("MLP-Mixer cross-entropy benchmark suite")
     parser.add_argument(
         "--datasets",
         nargs="+",
@@ -151,22 +152,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         nargs="+",
-        default=["bp", "local-bp"],
-        choices=["bp", "local-bp"],
+        default=["bp", "local-bp", "ce-matched-ge"],
+        choices=["bp", "local-bp", "ce-matched-ge"],
     )
     parser.add_argument("--depths", nargs="+", type=int, default=list(PAPER_DEPTHS))
     parser.add_argument("--dims", nargs="+", type=int, default=list(PAPER_DIMS))
-    parser.add_argument("--epochs", type=int, default=480)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument(
         "--early-stop-patience",
         type=int,
-        default=10,
+        default=15,
         help="Stop after this many epochs without validation-metric improvement.",
     )
     parser.add_argument(
         "--early-stop-min-delta",
         type=float,
-        default=1e-4,
+        default=0.0,
         help="Minimum strict improvement in the validation primary metric.",
     )
     parser.add_argument(
@@ -197,8 +198,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--local-bp-updates-per-block",
         type=int,
-        default=3,
-        help="Number of local optimizer updates per block and minibatch (default: 3).",
+        default=1,
+        help="Number of local optimizer updates per block and minibatch (default: 1).",
     )
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--output-dir", default="mlpmixer_suite_results")
@@ -213,6 +214,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="summary.csv",
         help="Seed-aggregated table written alongside the per-run results.",
     )
+    parser.add_argument(
+        "--heartbeat-file",
+        default="",
+        help="Optional JSON heartbeat path updated after every training epoch.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     seed_group = parser.add_mutually_exclusive_group()
     seed_group.add_argument(
@@ -226,7 +232,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="+",
         type=int,
         default=None,
-        help="Matched seeds for BP and Local BP (default: 41 42 43).",
+        help="Matched seeds for all cross-entropy variants (default: 424 425 426).",
     )
     parser.add_argument("--download-tinyimagenet", action="store_true")
     parser.add_argument("--download-coil100", action="store_true")
@@ -1120,7 +1126,7 @@ class BackpropMixer(nn.Module):
             ]
         )
         self.output_norm = nn.LayerNorm(model_dim)
-        self.classifier = nn.Linear(model_dim, num_classes)
+        self.classifier = nn.Linear(model_dim, num_classes, bias=False)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         hidden = self.patch_embedding(inputs)
@@ -1392,6 +1398,77 @@ def train_local_bp(
     return mean_loss, primary_sum / total_samples, secondary_sum / total_samples
 
 
+def train_global_multihead_ce(
+    model,
+    loader,
+    optimizer,
+    scaler,
+    device,
+    amp_enabled,
+    metadata,
+):
+    """Train all Mixer heads jointly while propagating every loss globally."""
+
+    criterion = task_loss(metadata["task"])
+    model.train()
+    total_samples = 0
+    primary_sum = secondary_sum = 0
+    layer_loss_sums = [0.0 for _ in range(model.depth)]
+    y_true_batches: list[np.ndarray] = []
+    y_score_batches: list[np.ndarray] = []
+    for images, targets in loader:
+        images = images.to(device, non_blocking=True)
+        targets = prepare_targets(targets, metadata["task"], device)
+        optimizer.zero_grad(set_to_none=True)
+        if amp_enabled:
+            with torch.autocast("cuda", dtype=torch.float16):
+                logits_by_layer = model.layer_logits(images)
+                layer_losses = [criterion(logits, targets) for logits in logits_by_layer]
+                # The local control applies every head loss at full scale. A
+                # sum preserves that scale while changing only gradient routing.
+                objective = torch.stack(layer_losses).sum()
+            scaler.scale(objective).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits_by_layer = model.layer_logits(images)
+            layer_losses = [criterion(logits, targets) for logits in logits_by_layer]
+            objective = torch.stack(layer_losses).sum()
+            objective.backward()
+            optimizer.step()
+
+        batch_size = targets.size(0)
+        total_samples += batch_size
+        for layer_index, loss in enumerate(layer_losses):
+            layer_loss_sums[layer_index] += loss.item() * batch_size
+        combined_logits = torch.stack([logits.detach() for logits in logits_by_layer]).sum(
+            dim=0
+        )
+        if metadata["is_medmnist"]:
+            append_medmnist_batches(
+                y_true_batches,
+                y_score_batches,
+                combined_logits,
+                targets,
+                metadata["task"],
+            )
+        else:
+            primary_correct, secondary_correct = count_topk_correct(
+                combined_logits, targets
+            )
+            primary_sum += primary_correct
+            secondary_sum += secondary_correct
+
+    mean_layer_losses = [loss_sum / total_samples for loss_sum in layer_loss_sums]
+    mean_loss = float(np.mean(mean_layer_losses))
+    if metadata["is_medmnist"]:
+        primary_metric, secondary_metric = compute_medmnist_metrics(
+            y_true_batches, y_score_batches, metadata["task"]
+        )
+        return mean_loss, primary_metric, secondary_metric
+    return mean_loss, primary_sum / total_samples, secondary_sum / total_samples
+
+
 @torch.no_grad()
 def eval_local_bp(model, loader, device, metadata):
     """Evaluate a Local BP Mixer by summing all local logits."""
@@ -1500,6 +1577,7 @@ def csv_header():
         "peak_train_mem_gb",
         "runtime_seconds",
         "num_params",
+        "terminal_classifier_bias",
         "checkpoint_path",
         "checkpoint_sha256",
         "history_path",
@@ -1712,6 +1790,7 @@ def run_signature(
         "early_stop_min_delta": args.early_stop_min_delta,
         "validation_fraction": args.validation_fraction,
         "dropout": MIXER_DROPOUT,
+        "terminal_classifier_bias": False if method == "bp" else None,
         "scheduler": SCHEDULER_NAME,
         "scheduler_t_max": args.epochs,
         "batch_size": args.batch_size,
@@ -1859,10 +1938,23 @@ def run_one(
         )
         scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
         scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-    else:
+    elif method == "local-bp":
         model = LocalBPMixer(**model_kwargs).to(device)
         optimizers, schedulers = build_local_bp_optimizers(model, args)
         scalers = build_local_bp_scalers(model.depth, amp_enabled)
+    elif method == "ce-matched-ge":
+        model = LocalBPMixer(**model_kwargs).to(device)
+        optimizer = build_optimizer(
+            args.optimizer,
+            model.parameters(),
+            args.lr,
+            args.weight_decay,
+            args.momentum,
+        )
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    else:  # pragma: no cover - guarded by CLI choices
+        raise ValueError(f"Unsupported method: {method}")
     parameter_count = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
     )
@@ -1893,7 +1985,7 @@ def run_one(
                 metadata,
             )
             scheduler.step()
-        else:
+        elif method == "local-bp":
             current_lr = float(optimizers[0].param_groups[0]["lr"])
             train_loss, train_primary, train_secondary = train_local_bp(
                 model,
@@ -1907,6 +1999,18 @@ def run_one(
             )
             for local_scheduler in schedulers:
                 local_scheduler.step()
+        else:
+            current_lr = float(optimizer.param_groups[0]["lr"])
+            train_loss, train_primary, train_secondary = train_global_multihead_ce(
+                model,
+                train_loader,
+                optimizer,
+                scaler,
+                device,
+                amp_enabled,
+                metadata,
+            )
+            scheduler.step()
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             peak_memory_bytes = max(
@@ -1979,6 +2083,23 @@ def run_one(
             f"{metric_secondary} {validation_secondary * 100:.2f}%",
             flush=True,
         )
+        if args.heartbeat_file:
+            atomic_json(
+                Path(args.heartbeat_file).expanduser().resolve(),
+                {
+                    "status": "running",
+                    "dataset": dataset_name,
+                    "method": method,
+                    "depth": depth,
+                    "dim": model_dim,
+                    "seed": run_seed,
+                    "epoch": epoch,
+                    "epochs_target": args.epochs,
+                    "best_epoch": best_epoch,
+                    "best_validation_primary": best_validation_primary,
+                    "updated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                },
+            )
         if epochs_without_improvement >= args.early_stop_patience:
             stopped_for_patience = True
             print(
@@ -2122,6 +2243,7 @@ def run_one(
         "peak_train_mem_gb": (peak_memory_bytes / (1024**3) if device.type == "cuda" else 0.0),
         "runtime_seconds": runtime_seconds,
         "num_params": parameter_count,
+        "terminal_classifier_bias": False if method == "bp" else None,
         "checkpoint_path": checkpoint_path,
         "checkpoint_sha256": checkpoint_sha256,
         "history_path": str(history_file),
@@ -2146,6 +2268,7 @@ def run_one(
                 "environment": environment,
                 "dataset_integrity": metadata.get("dataset_integrity", {}),
                 "selection": "validation_primary_strict_improvement",
+                "terminal_classifier_bias": False if method == "bp" else None,
                 "test_evaluated_once_after_best_checkpoint_restore": True,
             },
             sort_keys=True,

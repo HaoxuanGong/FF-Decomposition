@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "paper": "Disentangling Objective Design and Gradient Locality in Supervised Forward--Forward Learning",
+  "common": {
+    "seeds": [424, 425, 426],
+    "maximum_epochs": 200,
+    "patience": 15,
+    "strict_validation_improvement": true,
+    "restore_best_validation_checkpoint": true,
+    "test_policy": "Evaluate the official test split once after all validation-based selection is complete.",
+    "training_batch_size": 128
+  },
+  "mlp": {
+    "datasets": ["mnist", "fashionmnist", "cifar10", "cifar100"],
+    "architectures": {
+      "mnist": [1000, 1000],
+      "fashionmnist": [1000, 1000],
+      "cifar10": [2000, 2000, 2000],
+      "cifar100": [2000, 2000, 2000]
+    },
+    "activation": "relu",
+    "validation": "Seed-specific stratified 5000-example training holdout",
+    "profiles": {
+      "adam_constant": {
+        "optimizer": "adam",
+        "learning_rate": 0.001,
+        "scheduler": "none"
+      },
+      "adam_cosine": {
+        "optimizer": "adam",
+        "learning_rate": 0.001,
+        "scheduler": "cosine_annealing",
+        "t_max": 200,
+        "eta_min": 0.0
+      },
+      "sgd_step30": {
+        "optimizer": "sgd",
+        "learning_rate": 0.1,
+        "momentum": 0.9,
+        "nesterov": false,
+        "scheduler": "step_lr",
+        "step_size": 30,
+        "gamma": 0.1
+      }
+    },
+    "profile_selection": "Select independently for each method and dataset by mean best-validation accuracy across the three seeds.",
+    "profile_tie_break": ["adam_constant", "adam_cosine", "sgd_step30"],
+    "threshold_selection": {
+      "candidates": [1.0, 2.0, 4.0],
+      "scope": "Thresholded FF methods only",
+      "profile": "adam_constant",
+      "rule": "Select using validation performance and freeze before optimizer-profile selection.",
+      "tie_break": [1.0, 2.0, 4.0],
+      "frozen_values": {
+        "mnist": {"ff": 4.0, "ff-matched-ge": 1.0, "ff-ge": 4.0, "nn-ff-ge": 4.0},
+        "fashionmnist": {"ff": 4.0, "ff-matched-ge": 1.0, "ff-ge": 2.0, "nn-ff-ge": 2.0},
+        "cifar10": {"ff": 2.0, "ff-matched-ge": 1.0, "ff-ge": 1.0, "nn-ff-ge": 4.0},
+        "cifar100": {"ff": 1.0, "ff-matched-ge": 1.0, "ff-ge": 1.0, "nn-ff-ge": 4.0}
+      }
+    },
+    "methods": {
+      "ff": "Vanilla FF (Local, Multi-Head)",
+      "ff-matched-ge": "FF (Global, Multi-Head)",
+      "ff-ge": "FF (Global, Terminal)",
+      "nn-ff-ge": "NN-FF (Global, Terminal)",
+      "fc-ff": "FC-FF (Local, Multi-Head)",
+      "fc-ff-matched-ge": "FC-FF (Global, Multi-Head)",
+      "fc-ff-ge": "FC-FF (Global, Terminal)",
+      "fc-nn-ff-ge": "FC-NN-FF (Global, Terminal)",
+      "local-bp": "CE (Local, Multi-Head)",
+      "ce-matched-ge": "CE (Global, Multi-Head)",
+      "bp": "CE (Global, Terminal)"
+    },
+    "omissions": {
+      "cifar100": ["fc-ff", "fc-ff-matched-ge", "fc-ff-ge", "fc-nn-ff-ge"],
+      "reason": "Full comparison requires 100 class-conditioned evaluations per example."
+    },
+    "regularization": {
+      "augmentation": false,
+      "dropout": 0.0,
+      "weight_decay": 0.0
+    },
+    "classifier_bias": {
+      "ce_global_terminal": false,
+      "ce_local_multihead": false,
+      "ce_global_multihead": false
+    }
+  },
+  "cnn": {
+    "datasets": ["mnist", "fashionmnist", "cifar10", "cifar100"],
+    "architecture": {
+      "channels": [64, 128, 256, 512],
+      "blocks": "bias-free 3x3 convolution, batch normalization, ReLU, 2x2 max pooling"
+    },
+    "validation": "Seed-specific stratified 5000-example training holdout",
+    "profiles": ["adam_cosine", "sgd_step30"],
+    "profile_tie_break": ["adam_cosine", "sgd_step30"],
+    "methods": {
+      "local-bp": "CE (Local, Multi-Head)",
+      "ce-matched-ge": "CE (Global, Multi-Head)",
+      "bp": "CE (Global, Terminal)"
+    },
+    "regularization": {
+      "augmentation": false,
+      "dropout": 0.0,
+      "weight_decay": 0.0
+    },
+    "classifier_bias": {
+      "global_terminal": false,
+      "local_multihead": true,
+      "global_multihead": true
+    }
+  },
+  "mlp_mixer": {
+    "datasets": ["cifar10", "cifar100", "pathmnist", "tinyimagenet"],
+    "architecture": {
+      "depth": 5,
+      "embedding_dimension": 256,
+      "token_hidden_dimension": 256,
+      "channel_hidden_dimension": 1024,
+      "patch_sizes": {
+        "cifar10": 4,
+        "cifar100": 4,
+        "pathmnist": 7,
+        "tinyimagenet": 8
+      }
+    },
+    "profile": {
+      "optimizer": "adamw",
+      "learning_rate": 0.0003,
+      "weight_decay": 0.05,
+      "scheduler": "cosine_annealing",
+      "t_max": 200,
+      "eta_min": 0.0
+    },
+    "methods": {
+      "local-bp": "CE (Local, Multi-Head)",
+      "ce-matched-ge": "CE (Global, Multi-Head)",
+      "bp": "CE (Global, Terminal)"
+    },
+    "validation": "Official PathMNIST validation split; otherwise a seed-specific stratified 10% training holdout",
+    "dropout": 0.1,
+    "precision": "automatic mixed precision",
+    "augmentation": {
+      "cifar10": "random_crop_padding4+random_horizontal_flip",
+      "cifar100": "random_crop_padding4+random_horizontal_flip",
+      "pathmnist": "random_horizontal_flip+random_vertical_flip",
+      "tinyimagenet": "random_crop_padding4+random_horizontal_flip"
+    },
+    "classifier_bias": {
+      "global_terminal": false,
+      "local_multihead": true,
+      "global_multihead": true
+    }
+  }
+}

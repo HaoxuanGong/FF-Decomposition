@@ -1,48 +1,38 @@
-# This research workspace contains many unrelated scripts and generated runs.
-# Keep the initial FF-Decomposition release intentionally allowlisted.
-/*
-!/.gitattributes
-!/.gitignore
-!/pyproject.toml
-!/requirements.txt
-!/decomposition_core.py
-!/MLPBenchmarkSuite.py
-!/BroadMLPBenchmarkScheduler.py
-!/MatchedLocalityControlScheduler.py
-!/MatchedCELocalityControlScheduler.py
-!/NormalizationAblationScheduler.py
-!/LocalBPCNNBenchmark.py
-!/MatchedCNNLocalBPBenchmarkScheduler.py
-!/MLPMixerBenchmarkSuite.py
-!/ReducedMixerBenchmarkScheduler.py
-!/medmnist_support.py
-!/ReconstructionProbe.py
-!/ReconstructionExperimentScheduler.py
-!/tests/
-!/tests/**
-
-# Python, build, and editor state inside the released directories.
-**/__pycache__/
+# Python caches and build products
+__pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
 build/
 dist/
-*.egg-info/
+
+# Environments and editor state
+.venv/
+venv/
+.env
 .idea/
 .vscode/
 
-# Datasets, checkpoints, logs, and generated experiment artifacts.
+# Downloaded datasets and generated experiment artifacts
 data/
 results/
+runs/
+checkpoints/
 tmp*/
 lightning_logs/
 *.ckpt
-*.log
 *.pt
 *.pth
-*.csv
+*.log
+
+# Large rendered artifacts are generated from source and are not versioned.
 *.pdf
 *.png
 *.tif
 *.tiff
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db

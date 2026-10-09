@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the paper's matched backpropagation and Local BP MLP-Mixer sweep."""
+"""Run the paper's cross-entropy MLP-Mixer benchmark suite."""
 
 import argparse
 import csv
@@ -23,14 +23,14 @@ import torch
 import torch.nn as nn
 import torchvision
 from PIL import Image
-from torch.optim import Adam, AdamW, RMSprop, SGD
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 from torchvision.datasets import CIFAR10, CIFAR100, ImageFolder
 from torchvision.datasets.folder import IMG_EXTENSIONS
 
-from medmnist_support import (
+from pathmnist_data import (
     MEDMNIST_DATASETS,
     append_medmnist_batches,
     build_medmnist_splits,
@@ -40,13 +40,25 @@ from medmnist_support import (
 )
 
 TINY_URL = "https://cs231n.stanford.edu/tiny-imagenet-200.zip"
-COIL_URL = "https://www.cs.columbia.edu/CAVE/databases/SLAM_coil-20_coil-100/coil-100/coil-100.zip"
 TINY_REFERENCE_URL = "https://cs231n.stanford.edu/2016/project.html"
-COIL_REFERENCE_URL = "https://cave.cs.columbia.edu/repository/COIL-100"
-MAIN_DATASETS = ("cifar10", "cifar100", "tinyimagenet", "coil100", *MEDMNIST_DATASETS)
-PAPER_SEEDS = (41, 42, 43)
-PAPER_DEPTHS = (5, 8, 12)
-PAPER_DIMS = (256, 512)
+MAIN_DATASETS = ("cifar10", "cifar100", "pathmnist", "tinyimagenet")
+PAPER_METHODS = ("bp", "local-bp", "ce-matched-ge")
+PAPER_DEPTH = 5
+PAPER_DIM = 256
+PAPER_TOKEN_DIM = 256
+PAPER_CHANNEL_DIM = 1024
+PAPER_PATCH_SIZES = {
+    "cifar10": 4,
+    "cifar100": 4,
+    "pathmnist": 7,
+    "tinyimagenet": 8,
+}
+PAPER_LEARNING_RATE = 3e-4
+PAPER_WEIGHT_DECAY = 5e-2
+PAPER_MOMENTUM_METADATA = 0.9
+PAPER_VALIDATION_FRACTION = 0.1
+PAPER_EARLY_STOP_MIN_DELTA = 0.0
+PAPER_LOCAL_UPDATES = 1
 MIXER_DROPOUT = 0.1
 SCHEDULER_NAME = "cosine_annealing"
 RESULT_SCHEMA_VERSION = 2
@@ -57,8 +69,8 @@ def source_sha256() -> dict[str, str]:
 
     root = Path(__file__).resolve().parent
     return {
-        "MLPMixerBenchmarkSuite.py": file_sha256(root / "MLPMixerBenchmarkSuite.py"),
-        "medmnist_support.py": file_sha256(root / "medmnist_support.py"),
+        "mixer_experiment.py": file_sha256(root / "mixer_experiment.py"),
+        "pathmnist_data.py": file_sha256(root / "pathmnist_data.py"),
     }
 
 
@@ -84,172 +96,50 @@ def state_dicts_equal(
         for name in left
     )
 
-SUMMARY_GROUP_FIELDS = (
-    "dataset",
-    "method",
-    "depth",
-    "dim",
-    "token_dim",
-    "channel_dim",
-    "patch_size",
-    "num_classes",
-    "in_channels",
-    "image_size",
-    "task",
-    "metric_primary_name",
-    "metric_secondary_name",
-    "dataset_source",
-    "dataset_version",
-    "training_augmentation",
-    "final_evaluation_split",
-    "epochs_target",
-    "early_stop_patience",
-    "early_stop_min_delta",
-    "validation_fraction",
-    "validation_is_official",
-    "dropout",
-    "scheduler",
-    "scheduler_t_max",
-    "local_bp_updates_per_block",
-    "optimizer",
-    "lr",
-    "weight_decay",
-    "momentum",
-    "batch_size",
-    "eval_batch_size",
-    "train_samples",
-    "validation_samples",
-    "test_samples",
-    "num_workers",
-    "device",
-    "amp_enabled",
-    "torch_version",
-    "torchvision_version",
-    "cuda_runtime_version",
-    "cudnn_version",
-    "gpu_name",
-)
-SUMMARY_METRICS = (
-    ("test_primary", "test_primary"),
-    ("test_secondary", "test_secondary"),
-    ("best_validation_primary", "best_validation_primary"),
-    ("peak_train_mem_gb", "peak_train_mem_gb"),
-    ("runtime_seconds", "runtime_seconds"),
-    ("best_epoch", "best_epoch"),
-)
-
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser("MLP-Mixer BP vs Local BP benchmark suite")
+    parser = argparse.ArgumentParser("Run one paper MLP-Mixer benchmark job")
     parser.add_argument(
-        "--datasets",
-        nargs="+",
+        "--dataset",
         required=True,
         choices=MAIN_DATASETS,
-        help="One or more main-table datasets to benchmark.",
+        help="Paper dataset for this job.",
     )
     parser.add_argument(
-        "--methods",
-        nargs="+",
-        default=["bp", "local-bp"],
-        choices=["bp", "local-bp"],
+        "--method",
+        required=True,
+        choices=PAPER_METHODS,
+        help="Cross-entropy supervision variant for this job.",
     )
-    parser.add_argument("--depths", nargs="+", type=int, default=list(PAPER_DEPTHS))
-    parser.add_argument("--dims", nargs="+", type=int, default=list(PAPER_DIMS))
-    parser.add_argument("--epochs", type=int, default=480)
+    parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument(
         "--early-stop-patience",
         type=int,
-        default=10,
+        default=15,
         help="Stop after this many epochs without validation-metric improvement.",
-    )
-    parser.add_argument(
-        "--early-stop-min-delta",
-        type=float,
-        default=1e-4,
-        help="Minimum strict improvement in the validation primary metric.",
-    )
-    parser.add_argument(
-        "--validation-fraction",
-        type=float,
-        default=0.1,
-        help=(
-            "Seed-specific stratified validation fraction for datasets without an "
-            "official validation split (default: 0.1)."
-        ),
     )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument(
-        "--optimizer",
-        choices=["adamw", "adam", "sgd", "rmsprop"],
-        default="adamw",
-    )
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=5e-2)
-    parser.add_argument("--momentum", type=float, default=0.9)
-    parser.add_argument("--token-dim", type=int, default=0)
-    parser.add_argument("--channel-dim", type=int, default=0)
-    parser.add_argument("--token-ratio", type=float, default=1.0)
-    parser.add_argument("--channel-ratio", type=float, default=4.0)
-    parser.add_argument("--patch-size", type=int, default=0, help="0 => dataset default")
-    parser.add_argument(
-        "--local-bp-updates-per-block",
-        type=int,
-        default=3,
-        help="Number of local optimizer updates per block and minibatch (default: 3).",
-    )
     parser.add_argument("--data-dir", default="./data")
-    parser.add_argument("--output-dir", default="mlpmixer_suite_results")
+    parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--checkpoint-dir",
         default="",
         help="Optional directory in which to save restored best checkpoints.",
     )
-    parser.add_argument("--results-csv", default="results.csv")
     parser.add_argument(
-        "--summary-csv",
-        default="summary.csv",
-        help="Seed-aggregated table written alongside the per-run results.",
+        "--heartbeat-file",
+        default="",
+        help="Optional JSON heartbeat path updated after every training epoch.",
     )
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    seed_group = parser.add_mutually_exclusive_group()
-    seed_group.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Run one seed instead of the paper's three-seed default.",
-    )
-    seed_group.add_argument(
-        "--seeds",
-        nargs="+",
-        type=int,
-        default=None,
-        help="Matched seeds for BP and Local BP (default: 41 42 43).",
+    parser.add_argument(
+        "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument("--download-tinyimagenet", action="store_true")
-    parser.add_argument("--download-coil100", action="store_true")
-    parser.add_argument("--skip-existing", action="store_true", default=True)
-    parser.add_argument("--no-skip-existing", action="store_false", dest="skip_existing")
     parser.add_argument("--disable-amp", action="store_true")
     return parser.parse_args(argv)
-
-
-def resolve_seeds(args: argparse.Namespace) -> list[int]:
-    if args.seeds is not None:
-        seeds = list(args.seeds)
-    elif args.seed is not None:
-        seeds = [args.seed]
-    else:
-        seeds = list(PAPER_SEEDS)
-    if not seeds:
-        raise ValueError("at least one seed is required")
-    if any(seed < 0 for seed in seeds):
-        raise ValueError("seeds cannot be negative")
-    if len(seeds) != len(set(seeds)):
-        raise ValueError("seeds must be unique")
-    return seeds
 
 
 def set_seed(seed: int) -> None:
@@ -324,25 +214,13 @@ def save_checkpoint_atomic(path: Path, payload: dict[str, object]) -> str:
     return file_sha256(path)
 
 
-def build_optimizer(optimizer_name, parameters, learning_rate, weight_decay, momentum):
-    """Construct an optimizer from the shared command-line settings."""
+def build_optimizer(parameters):
+    """Construct the fixed AdamW optimizer used in the paper."""
 
-    if optimizer_name == "adamw":
-        return AdamW(parameters, lr=learning_rate, weight_decay=weight_decay)
-    if optimizer_name == "adam":
-        return Adam(parameters, lr=learning_rate, weight_decay=weight_decay)
-    if optimizer_name == "sgd":
-        return SGD(
-            parameters,
-            lr=learning_rate,
-            momentum=momentum,
-            weight_decay=weight_decay,
-        )
-    return RMSprop(
+    return AdamW(
         parameters,
-        lr=learning_rate,
-        momentum=momentum,
-        weight_decay=weight_decay,
+        lr=PAPER_LEARNING_RATE,
+        weight_decay=PAPER_WEIGHT_DECAY,
     )
 
 
@@ -395,9 +273,7 @@ def extract_zip_safely(archive: Path, destination: Path) -> None:
         zip_file.extractall(destination)
 
 
-def canonical_tree_fingerprint(
-    root: Path, files: list[Path]
-) -> dict[str, int | str]:
+def canonical_tree_fingerprint(root: Path, files: list[Path]) -> dict[str, int | str]:
     """Hash relative paths, sizes, and bytes for an explicitly selected file tree."""
 
     resolved_root = root.resolve()
@@ -468,9 +344,7 @@ def tinyimagenet_integrity(
             f"Tiny ImageNet must contain {expected_class_count} unique class IDs"
         )
     train_root = dataset_root / "train"
-    observed_class_dirs = {
-        path.name for path in train_root.iterdir() if path.is_dir()
-    }
+    observed_class_dirs = {path.name for path in train_root.iterdir() if path.is_dir()}
     if observed_class_dirs != set(wnids):
         raise ValueError("Tiny ImageNet training directories do not match wnids.txt")
 
@@ -487,8 +361,7 @@ def tinyimagenet_integrity(
             if path.is_file() and path.suffix.lower() in IMG_EXTENSIONS
         )
         if any(
-            path.parent != image_dir or path.suffix != ".JPEG"
-            for path in class_images
+            path.parent != image_dir or path.suffix != ".JPEG" for path in class_images
         ):
             raise ValueError("Tiny ImageNet contains an unexpected training-image path")
         train_counts[class_id] = len(class_images)
@@ -554,7 +427,9 @@ def tinyimagenet_integrity(
     }
 
 
-def ensure_tiny(data_root: Path, allow_download: bool) -> tuple[Path, dict[str, object]]:
+def ensure_tiny(
+    data_root: Path, allow_download: bool
+) -> tuple[Path, dict[str, object]]:
     dataset_root = data_root / "tiny-imagenet-200"
     if (dataset_root / "train").exists() and (dataset_root / "val").exists():
         archive_path = data_root / "tiny-imagenet-200.zip"
@@ -597,59 +472,12 @@ class TinyImageNetValidation(Dataset):
         return self.transform(image), label
 
 
-def coil100_integrity(
-    dataset_root: Path,
-    archive: Path,
-    *,
-    expected_object_count: int = 100,
-    expected_angles: tuple[int, ...] = tuple(range(0, 360, 5)),
-) -> dict[str, object]:
-    """Validate COIL-100's object/angle layout and compute local fingerprints."""
-
-    filename_pattern = re.compile(r"obj(\d+)__(\d+)\.png", re.IGNORECASE)
-    images = sorted(dataset_root.glob("obj*__*.png"))
-    observed: dict[int, set[int]] = {}
-    for image in images:
-        match = filename_pattern.fullmatch(image.name)
-        if match is None:
-            raise ValueError(f"Malformed COIL-100 filename: {image.name}")
-        object_id, angle = int(match.group(1)), int(match.group(2))
-        if angle in observed.setdefault(object_id, set()):
-            raise ValueError(f"Duplicate COIL-100 object/angle pair: {image.name}")
-        observed[object_id].add(angle)
-    expected_objects = set(range(1, expected_object_count + 1))
-    expected_angle_set = set(expected_angles)
-    if set(observed) != expected_objects or any(
-        angles != expected_angle_set for angles in observed.values()
-    ):
-        raise ValueError(
-            "COIL-100 layout must contain every expected object at every expected angle"
-        )
-    tree = canonical_tree_fingerprint(dataset_root, images)
-    return {
-        "dataset": "coil100",
-        "status": "expected_structure_validated",
-        "source_url": COIL_URL,
-        "reference_url": COIL_REFERENCE_URL,
-        "source_published_checksum_available": False,
-        "fingerprint_scope": "all processed COIL-100 PNG files",
-        "expected_structure": {
-            "objects": expected_object_count,
-            "angles_degrees": list(expected_angles),
-            "images_per_object": len(expected_angles),
-            "images": expected_object_count * len(expected_angles),
-        },
-        "archive": archive_fingerprint(archive),
-        **tree,
-    }
-
-
 def validate_dataset_integrity_record(
     dataset: str, record: object
 ) -> dict[str, object]:
     """Validate the internally recorded provenance for non-library datasets."""
 
-    if dataset not in {"tinyimagenet", "coil100"}:
+    if dataset != "tinyimagenet":
         if record in (None, {}):
             return {}
         if isinstance(record, dict):
@@ -658,17 +486,10 @@ def validate_dataset_integrity_record(
     if not isinstance(record, dict):
         raise ValueError(f"Missing dataset-integrity record for {dataset}")
     expected = {
-        "tinyimagenet": {
-            "source_url": TINY_URL,
-            "reference_url": TINY_REFERENCE_URL,
-            "tree_file_count": 110002,
-        },
-        "coil100": {
-            "source_url": COIL_URL,
-            "reference_url": COIL_REFERENCE_URL,
-            "tree_file_count": 7200,
-        },
-    }[dataset]
+        "source_url": TINY_URL,
+        "reference_url": TINY_REFERENCE_URL,
+        "tree_file_count": 110002,
+    }
     for key, value in {
         "dataset": dataset,
         "status": "expected_structure_validated",
@@ -680,7 +501,10 @@ def validate_dataset_integrity_record(
     digest = record.get("tree_sha256", "")
     if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
         raise ValueError(f"Invalid {dataset} tree SHA-256")
-    if not isinstance(record.get("tree_total_bytes"), int) or record["tree_total_bytes"] <= 0:
+    if (
+        not isinstance(record.get("tree_total_bytes"), int)
+        or record["tree_total_bytes"] <= 0
+    ):
         raise ValueError(f"Invalid {dataset} tree byte count")
     archive = record.get("archive")
     if not isinstance(archive, dict) or not isinstance(archive.get("available"), bool):
@@ -699,59 +523,6 @@ def validate_dataset_integrity_record(
     return record
 
 
-def ensure_coil(data_root: Path, allow_download: bool) -> tuple[Path, dict[str, object]]:
-    dataset_root = data_root / "coil-100"
-    if dataset_root.exists() and any(dataset_root.glob("obj*__*.png")):
-        archive_path = data_root / "coil-100.zip"
-        return dataset_root, coil100_integrity(dataset_root, archive_path)
-    if not allow_download:
-        raise FileNotFoundError(f"{dataset_root} missing. Use --download-coil100")
-    archive_path = data_root / "coil-100.zip"
-    ensure_download(COIL_URL, archive_path)
-    extract_zip_safely(archive_path, data_root)
-    return dataset_root, coil100_integrity(dataset_root, archive_path)
-
-
-class ImagePathDataset(Dataset):
-    """Load labelled images from an explicit list of paths."""
-
-    def __init__(self, samples: list[tuple[Path, int]], transform):
-        self.samples = samples
-        self.transform = transform
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, index: int):
-        image_path, label = self.samples[index]
-        image = Image.open(image_path).convert("RGB")
-        return self.transform(image), label
-
-
-def build_coil_splits(
-    root: Path,
-) -> tuple[list[tuple[Path, int]], list[tuple[Path, int]]]:
-    filename_pattern = re.compile(r"obj(\d+)__(\d+)\.png", re.IGNORECASE)
-    samples_by_class: dict[int, list[tuple[int, Path]]] = {}
-    for image_path in sorted(root.glob("obj*__*.png")):
-        match = filename_pattern.match(image_path.name)
-        if not match:
-            continue
-        class_index = int(match.group(1)) - 1
-        angle = int(match.group(2))
-        samples_by_class.setdefault(class_index, []).append((angle, image_path))
-    train_samples, test_samples = [], []
-    for class_index in sorted(samples_by_class):
-        class_samples = sorted(samples_by_class[class_index], key=lambda sample: sample[0])
-        train_count = max(1, int(0.8 * len(class_samples)))
-        class_train, class_test = class_samples[:train_count], class_samples[train_count:]
-        if not class_test:
-            class_train, class_test = class_samples[:-1], class_samples[-1:]
-        train_samples += [(image_path, class_index) for _, image_path in class_train]
-        test_samples += [(image_path, class_index) for _, image_path in class_test]
-    return train_samples, test_samples
-
-
 def build_dataset(dataset_name: str, data_root: Path, args):
     dataset_name = dataset_name.lower()
     if dataset_name == "cifar10":
@@ -760,19 +531,29 @@ def build_dataset(dataset_name: str, data_root: Path, args):
                 transforms.RandomCrop(32, padding=4),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2471, 0.2435, 0.2616)),
+                transforms.Normalize(
+                    (0.4914, 0.4822, 0.4465), (0.2471, 0.2435, 0.2616)
+                ),
             ]
         )
         test_transform = transforms.Compose(
             [
                 transforms.ToTensor(),
-                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2471, 0.2435, 0.2616)),
+                transforms.Normalize(
+                    (0.4914, 0.4822, 0.4465), (0.2471, 0.2435, 0.2616)
+                ),
             ]
         )
         return (
-            CIFAR10(str(data_root), train=True, download=True, transform=train_transform),
-            CIFAR10(str(data_root), train=True, download=True, transform=test_transform),
-            CIFAR10(str(data_root), train=False, download=True, transform=test_transform),
+            CIFAR10(
+                str(data_root), train=True, download=True, transform=train_transform
+            ),
+            CIFAR10(
+                str(data_root), train=True, download=True, transform=test_transform
+            ),
+            CIFAR10(
+                str(data_root), train=False, download=True, transform=test_transform
+            ),
             dict(
                 num_classes=10,
                 in_channels=3,
@@ -795,19 +576,29 @@ def build_dataset(dataset_name: str, data_root: Path, args):
                 transforms.RandomCrop(32, padding=4),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                transforms.Normalize((0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762)),
+                transforms.Normalize(
+                    (0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762)
+                ),
             ]
         )
         test_transform = transforms.Compose(
             [
                 transforms.ToTensor(),
-                transforms.Normalize((0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762)),
+                transforms.Normalize(
+                    (0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762)
+                ),
             ]
         )
         return (
-            CIFAR100(str(data_root), train=True, download=True, transform=train_transform),
-            CIFAR100(str(data_root), train=True, download=True, transform=test_transform),
-            CIFAR100(str(data_root), train=False, download=True, transform=test_transform),
+            CIFAR100(
+                str(data_root), train=True, download=True, transform=train_transform
+            ),
+            CIFAR100(
+                str(data_root), train=True, download=True, transform=test_transform
+            ),
+            CIFAR100(
+                str(data_root), train=False, download=True, transform=test_transform
+            ),
             dict(
                 num_classes=100,
                 in_channels=3,
@@ -842,7 +633,9 @@ def build_dataset(dataset_name: str, data_root: Path, args):
         )
         train_set = ImageFolder(dataset_root / "train", transform=train_transform)
         validation_pool = ImageFolder(dataset_root / "train", transform=test_transform)
-        test_set = TinyImageNetValidation(dataset_root, train_set.class_to_idx, test_transform)
+        test_set = TinyImageNetValidation(
+            dataset_root, train_set.class_to_idx, test_transform
+        )
         return (
             train_set,
             validation_pool,
@@ -862,46 +655,6 @@ def build_dataset(dataset_name: str, data_root: Path, args):
                 dataset_integrity=dataset_integrity,
                 training_augmentation="random_crop_padding4+random_horizontal_flip",
                 final_evaluation_split="official_validation_with_labels",
-            ),
-        )
-    if dataset_name == "coil100":
-        dataset_root, dataset_integrity = ensure_coil(data_root, args.download_coil100)
-        train_samples, test_samples = build_coil_splits(dataset_root)
-        channel_mean, channel_std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
-        train_transform = transforms.Compose(
-            [
-                transforms.Resize((128, 128)),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize(channel_mean, channel_std),
-            ]
-        )
-        test_transform = transforms.Compose(
-            [
-                transforms.Resize((128, 128)),
-                transforms.ToTensor(),
-                transforms.Normalize(channel_mean, channel_std),
-            ]
-        )
-        return (
-            ImagePathDataset(train_samples, train_transform),
-            ImagePathDataset(train_samples, test_transform),
-            ImagePathDataset(test_samples, test_transform),
-            dict(
-                num_classes=100,
-                in_channels=3,
-                image_size=128,
-                patch_default=16,
-                task="multi-class",
-                metric_primary_name="top1",
-                metric_secondary_name="top5",
-                is_medmnist=False,
-                validation_is_official=False,
-                dataset_source="Columbia Object Image Library COIL-100",
-                dataset_version="coil-100",
-                dataset_integrity=dataset_integrity,
-                training_augmentation="resize128+random_horizontal_flip",
-                final_evaluation_split="deterministic_angle_holdout",
             ),
         )
     if dataset_name in MEDMNIST_DATASETS:
@@ -971,14 +724,18 @@ def make_loaders(
         split_protocol = "official_train_validation"
     else:
         if len(train_set) != len(validation_set):
-            raise ValueError("training and validation-view datasets must be index-aligned")
+            raise ValueError(
+                "training and validation-view datasets must be index-aligned"
+            )
         training_labels = dataset_targets(train_set)
         validation_labels = dataset_targets(validation_set)
         if not np.array_equal(training_labels, validation_labels):
-            raise ValueError("training and validation-view labels are not index-aligned")
+            raise ValueError(
+                "training and validation-view labels are not index-aligned"
+            )
         train_indices, validation_indices = stratified_train_validation_indices(
             training_labels,
-            args.validation_fraction,
+            PAPER_VALIDATION_FRACTION,
             seed,
         )
         selected_train_set = Subset(train_set, train_indices)
@@ -1104,7 +861,9 @@ class BackpropMixer(nn.Module):
         super().__init__()
         num_patches = (image_size // patch_size) ** 2
         self.patch_embedding = nn.Sequential(
-            nn.Conv2d(in_channels, model_dim, kernel_size=patch_size, stride=patch_size),
+            nn.Conv2d(
+                in_channels, model_dim, kernel_size=patch_size, stride=patch_size
+            ),
             ImageToPatchSequence(),
         )
         self.blocks = nn.ModuleList(
@@ -1120,7 +879,7 @@ class BackpropMixer(nn.Module):
             ]
         )
         self.output_norm = nn.LayerNorm(model_dim)
-        self.classifier = nn.Linear(model_dim, num_classes)
+        self.classifier = nn.Linear(model_dim, num_classes, bias=False)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         hidden = self.patch_embedding(inputs)
@@ -1148,7 +907,9 @@ class LocalBPMixer(nn.Module):
         num_patches = (image_size // patch_size) ** 2
         self.depth = depth
         self.patch_embedding = nn.Sequential(
-            nn.Conv2d(in_channels, model_dim, kernel_size=patch_size, stride=patch_size),
+            nn.Conv2d(
+                in_channels, model_dim, kernel_size=patch_size, stride=patch_size
+            ),
             ImageToPatchSequence(),
         )
         self.blocks = nn.ModuleList(
@@ -1163,8 +924,12 @@ class LocalBPMixer(nn.Module):
                 for _ in range(depth)
             ]
         )
-        self.local_norms = nn.ModuleList([nn.LayerNorm(model_dim) for _ in range(depth)])
-        self.local_heads = nn.ModuleList([nn.Linear(model_dim, num_classes) for _ in range(depth)])
+        self.local_norms = nn.ModuleList(
+            [nn.LayerNorm(model_dim) for _ in range(depth)]
+        )
+        self.local_heads = nn.ModuleList(
+            [nn.Linear(model_dim, num_classes) for _ in range(depth)]
+        )
 
     def layer_logits(self, inputs: torch.Tensor) -> list[torch.Tensor]:
         logits_by_layer = []
@@ -1213,7 +978,9 @@ def train_bp(model, loader, optimizer, scaler, device, amp_enabled, metadata):
                 metadata["task"],
             )
         else:
-            primary_correct, secondary_correct = count_topk_correct(logits.detach(), targets)
+            primary_correct, secondary_correct = count_topk_correct(
+                logits.detach(), targets
+            )
             primary_sum += primary_correct
             secondary_sum += secondary_correct
     if metadata["is_medmnist"]:
@@ -1221,7 +988,11 @@ def train_bp(model, loader, optimizer, scaler, device, amp_enabled, metadata):
             y_true_batches, y_score_batches, metadata["task"]
         )
         return loss_sum / total_samples, primary_metric, secondary_metric
-    return loss_sum / total_samples, primary_sum / total_samples, secondary_sum / total_samples
+    return (
+        loss_sum / total_samples,
+        primary_sum / total_samples,
+        secondary_sum / total_samples,
+    )
 
 
 @torch.no_grad()
@@ -1259,7 +1030,11 @@ def eval_bp(model, loader, device, metadata):
             y_true_batches, y_score_batches, metadata["task"]
         )
         return loss_sum / total_samples, primary_metric, secondary_metric
-    return loss_sum / total_samples, primary_sum / total_samples, secondary_sum / total_samples
+    return (
+        loss_sum / total_samples,
+        primary_sum / total_samples,
+        secondary_sum / total_samples,
+    )
 
 
 def build_local_bp_optimizers(model: LocalBPMixer, args):
@@ -1275,13 +1050,7 @@ def build_local_bp_optimizers(model: LocalBPMixer, args):
             + list(model.local_norms[layer_index].parameters())
             + list(model.local_heads[layer_index].parameters())
         )
-        optimizer = build_optimizer(
-            args.optimizer,
-            parameters,
-            args.lr,
-            args.weight_decay,
-            args.momentum,
-        )
+        optimizer = build_optimizer(parameters)
         scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
         optimizers.append(optimizer)
         schedulers.append(scheduler)
@@ -1307,7 +1076,9 @@ def train_local_bp(
     """Train every Mixer block with a detached local cross-entropy objective."""
 
     if len(optimizers) != model.depth or len(scalers) != model.depth:
-        raise ValueError("Local BP requires one optimizer and gradient scaler per block")
+        raise ValueError(
+            "CE (Local, Multi-Head) requires one optimizer and scaler per block"
+        )
     criterion = task_loss(metadata["task"])
     model.train()
     total_samples = 0
@@ -1341,7 +1112,9 @@ def train_local_bp(
                             else detached_activation
                         )
                         activation = model.blocks[layer_index](layer_input)
-                        normalized = model.local_norms[layer_index](activation).mean(dim=1)
+                        normalized = model.local_norms[layer_index](activation).mean(
+                            dim=1
+                        )
                         logits = model.local_heads[layer_index](normalized)
                         loss = criterion(logits, targets)
                     optimizer.zero_grad(set_to_none=True)
@@ -1350,7 +1123,9 @@ def train_local_bp(
                     scaler.update()
                 else:
                     layer_input = (
-                        model.patch_embedding(images) if layer_index == 0 else detached_activation
+                        model.patch_embedding(images)
+                        if layer_index == 0
+                        else detached_activation
                     )
                     activation = model.blocks[layer_index](layer_input)
                     normalized = model.local_norms[layer_index](activation).mean(dim=1)
@@ -1362,13 +1137,17 @@ def train_local_bp(
                 local_loss_sum += loss.item()
                 last_activation = activation.detach()
                 last_logits = logits.detach()
-            # Streaming Local BP: forward the activation produced during the
+            # Local multi-head update: forward the activation produced during the
             # local update, rather than recomputing the block once more.
-            if last_activation is None or last_logits is None:  # pragma: no cover - validated CLI
-                raise RuntimeError("Local BP update produced no activation")
+            if (
+                last_activation is None or last_logits is None
+            ):  # pragma: no cover - validated CLI
+                raise RuntimeError("Local multi-head update produced no activation")
             logits_by_layer.append(last_logits)
             detached_activation = last_activation
-            layer_loss_sums[layer_index] += (local_loss_sum / updates_per_block) * batch_size
+            layer_loss_sums[layer_index] += (
+                local_loss_sum / updates_per_block
+            ) * batch_size
         combined_logits = torch.stack(logits_by_layer).sum(dim=0)
         if metadata["is_medmnist"]:
             append_medmnist_batches(
@@ -1379,7 +1158,9 @@ def train_local_bp(
                 metadata["task"],
             )
         else:
-            primary_correct, secondary_correct = count_topk_correct(combined_logits, targets)
+            primary_correct, secondary_correct = count_topk_correct(
+                combined_logits, targets
+            )
             primary_sum += primary_correct
             secondary_sum += secondary_correct
     mean_layer_losses = [loss_sum / total_samples for loss_sum in layer_loss_sums]
@@ -1392,9 +1173,82 @@ def train_local_bp(
     return mean_loss, primary_sum / total_samples, secondary_sum / total_samples
 
 
+def train_global_multihead_ce(
+    model,
+    loader,
+    optimizer,
+    scaler,
+    device,
+    amp_enabled,
+    metadata,
+):
+    """Train all Mixer heads jointly while propagating every loss globally."""
+
+    criterion = task_loss(metadata["task"])
+    model.train()
+    total_samples = 0
+    primary_sum = secondary_sum = 0
+    layer_loss_sums = [0.0 for _ in range(model.depth)]
+    y_true_batches: list[np.ndarray] = []
+    y_score_batches: list[np.ndarray] = []
+    for images, targets in loader:
+        images = images.to(device, non_blocking=True)
+        targets = prepare_targets(targets, metadata["task"], device)
+        optimizer.zero_grad(set_to_none=True)
+        if amp_enabled:
+            with torch.autocast("cuda", dtype=torch.float16):
+                logits_by_layer = model.layer_logits(images)
+                layer_losses = [
+                    criterion(logits, targets) for logits in logits_by_layer
+                ]
+                # The local control applies every head loss at full scale. A
+                # sum preserves that scale while changing only gradient routing.
+                objective = torch.stack(layer_losses).sum()
+            scaler.scale(objective).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits_by_layer = model.layer_logits(images)
+            layer_losses = [criterion(logits, targets) for logits in logits_by_layer]
+            objective = torch.stack(layer_losses).sum()
+            objective.backward()
+            optimizer.step()
+
+        batch_size = targets.size(0)
+        total_samples += batch_size
+        for layer_index, loss in enumerate(layer_losses):
+            layer_loss_sums[layer_index] += loss.item() * batch_size
+        combined_logits = torch.stack(
+            [logits.detach() for logits in logits_by_layer]
+        ).sum(dim=0)
+        if metadata["is_medmnist"]:
+            append_medmnist_batches(
+                y_true_batches,
+                y_score_batches,
+                combined_logits,
+                targets,
+                metadata["task"],
+            )
+        else:
+            primary_correct, secondary_correct = count_topk_correct(
+                combined_logits, targets
+            )
+            primary_sum += primary_correct
+            secondary_sum += secondary_correct
+
+    mean_layer_losses = [loss_sum / total_samples for loss_sum in layer_loss_sums]
+    mean_loss = float(np.mean(mean_layer_losses))
+    if metadata["is_medmnist"]:
+        primary_metric, secondary_metric = compute_medmnist_metrics(
+            y_true_batches, y_score_batches, metadata["task"]
+        )
+        return mean_loss, primary_metric, secondary_metric
+    return mean_loss, primary_sum / total_samples, secondary_sum / total_samples
+
+
 @torch.no_grad()
 def eval_local_bp(model, loader, device, metadata):
-    """Evaluate a Local BP Mixer by summing all local logits."""
+    """Evaluate CE (Local, Multi-Head) by summing all head logits."""
 
     criterion = task_loss(metadata["task"])
     model.eval()
@@ -1420,7 +1274,9 @@ def eval_local_bp(model, loader, device, metadata):
                 metadata["task"],
             )
         else:
-            primary_correct, secondary_correct = count_topk_correct(combined_logits, targets)
+            primary_correct, secondary_correct = count_topk_correct(
+                combined_logits, targets
+            )
             primary_sum += primary_correct
             secondary_sum += secondary_correct
     if metadata["is_medmnist"]:
@@ -1428,7 +1284,11 @@ def eval_local_bp(model, loader, device, metadata):
             y_true_batches, y_score_batches, metadata["task"]
         )
         return loss_sum / total_samples, primary_metric, secondary_metric
-    return loss_sum / total_samples, primary_sum / total_samples, secondary_sum / total_samples
+    return (
+        loss_sum / total_samples,
+        primary_sum / total_samples,
+        secondary_sum / total_samples,
+    )
 
 
 def csv_header():
@@ -1500,6 +1360,7 @@ def csv_header():
         "peak_train_mem_gb",
         "runtime_seconds",
         "num_params",
+        "terminal_classifier_bias",
         "checkpoint_path",
         "checkpoint_sha256",
         "history_path",
@@ -1535,8 +1396,8 @@ def validate_reusable_row(row: dict[str, str]) -> None:
     sources = source_sha256()
     expected = {
         "result_schema_version": str(RESULT_SCHEMA_VERSION),
-        "suite_source_sha256": sources["MLPMixerBenchmarkSuite.py"],
-        "support_source_sha256": sources["medmnist_support.py"],
+        "suite_source_sha256": sources["mixer_experiment.py"],
+        "support_source_sha256": sources["pathmnist_data.py"],
         "test_evaluations": "1",
         "selection_rule": "validation_primary_strict_improvement",
         "restored_best_state_verified": "1",
@@ -1611,12 +1472,15 @@ def validate_reusable_row(row: dict[str, str]) -> None:
             bad_epochs += 1
         if int(item["epochs_without_improvement"]) != bad_epochs:
             raise ValueError(f"Patience history mismatch: {history_path}")
-        if not math.isclose(
-            float(item["best_validation_primary"]),
-            best,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        ) or int(item["best_epoch"]) != best_epoch:
+        if (
+            not math.isclose(
+                float(item["best_validation_primary"]),
+                best,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or int(item["best_epoch"]) != best_epoch
+        ):
             raise ValueError(f"Stored best history mismatch: {history_path}")
         if bad_epochs == patience and expected_epoch != len(history):
             raise ValueError(f"Training continued beyond patience: {history_path}")
@@ -1660,35 +1524,9 @@ def validate_reusable_row(row: dict[str, str]) -> None:
         raise ValueError(f"Checkpoint audit metadata mismatch: {checkpoint_path}")
 
 
-def load_done(csv_path: Path):
-    if not csv_path.exists() or csv_path.stat().st_size == 0:
-        return set()
-    done = set()
-    with open(csv_path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames != csv_header():
-            raise ValueError(
-                f"Results schema mismatch in {csv_path}; use a new --results-csv "
-                "instead of appending to a legacy file"
-            )
-        for r in reader:
-            if r.get("status") != "ok":
-                continue
-            validate_reusable_row(r)
-            signature = r.get("run_signature", "").strip()
-            if signature:
-                done.add(signature)
-    return done
-
-
 def run_signature(
     dataset: str,
     method: str,
-    depth: int,
-    dim: int,
-    token_dim: int,
-    channel_dim: int,
-    patch_size: int,
     seed: int,
     args,
     dataset_integrity: dict[str, object],
@@ -1701,27 +1539,28 @@ def run_signature(
         "dataset_integrity": dataset_integrity,
         "dataset": dataset,
         "method": method,
-        "depth": depth,
-        "dim": dim,
-        "token_dim": token_dim,
-        "channel_dim": channel_dim,
-        "patch_size": patch_size,
+        "depth": PAPER_DEPTH,
+        "dim": PAPER_DIM,
+        "token_dim": PAPER_TOKEN_DIM,
+        "channel_dim": PAPER_CHANNEL_DIM,
+        "patch_size": PAPER_PATCH_SIZES[dataset],
         "seed": seed,
         "epochs": args.epochs,
         "early_stop_patience": args.early_stop_patience,
-        "early_stop_min_delta": args.early_stop_min_delta,
-        "validation_fraction": args.validation_fraction,
+        "early_stop_min_delta": PAPER_EARLY_STOP_MIN_DELTA,
+        "validation_fraction": PAPER_VALIDATION_FRACTION,
         "dropout": MIXER_DROPOUT,
+        "terminal_classifier_bias": False if method == "bp" else None,
         "scheduler": SCHEDULER_NAME,
         "scheduler_t_max": args.epochs,
         "batch_size": args.batch_size,
         "eval_batch_size": args.eval_batch_size,
-        "optimizer": args.optimizer,
-        "lr": args.lr,
-        "weight_decay": args.weight_decay,
-        "momentum": args.momentum,
+        "optimizer": "adamw",
+        "lr": PAPER_LEARNING_RATE,
+        "weight_decay": PAPER_WEIGHT_DECAY,
+        "momentum": PAPER_MOMENTUM_METADATA,
         "local_bp_updates_per_block": (
-            args.local_bp_updates_per_block if method == "local-bp" else 0
+            PAPER_LOCAL_UPDATES if method == "local-bp" else 0
         ),
         "amp": torch.device(args.device).type == "cuda" and not args.disable_amp,
         "device": str(torch.device(args.device)),
@@ -1730,96 +1569,22 @@ def run_signature(
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
-def append_row(csv_path: Path, row: dict[str, object]):
+def write_result(csv_path: Path, row: dict[str, object]) -> None:
+    """Atomically write the single result produced by this worker."""
+
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    write_head = not csv_path.exists() or csv_path.stat().st_size == 0
-    head = csv_header()
-    if csv_path.exists() and csv_path.stat().st_size > 0:
-        with csv_path.open("r", newline="", encoding="utf-8") as existing:
-            if next(csv.reader(existing), None) != head:
-                raise ValueError(f"Results schema mismatch in {csv_path}; use a new --results-csv")
-    with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=head)
-        if write_head:
-            w.writeheader()
-        w.writerow({k: row.get(k, "") for k in head})
-
-
-def summary_header() -> list[str]:
-    fields = [*SUMMARY_GROUP_FIELDS, "num_runs"]
-    for output_name, _raw_name in SUMMARY_METRICS:
-        fields.extend((f"{output_name}_mean", f"{output_name}_std"))
-    return fields
-
-
-def _mean_and_sample_std(values: list[float]) -> tuple[float, float | str]:
-    mean = float(np.mean(values))
-    if len(values) == 1:
-        return mean, ""
-    return mean, float(np.std(values, ddof=1))
-
-
-def write_summary(results_csv: Path, summary_csv: Path) -> None:
-    """Aggregate successful seed runs without mixing distinct configurations."""
-
-    groups: dict[tuple[str, ...], list[dict[str, str]]] = {}
-    successful_rows: list[dict[str, str]] = []
-    if results_csv.exists():
-        with results_csv.open("r", newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            if reader.fieldnames != csv_header():
-                raise ValueError(
-                    f"Results schema mismatch in {results_csv}; use a new --results-csv"
-                )
-            successful_rows = [row for row in reader if row.get("status") == "ok"]
-
-    # Rerunning with --no-skip-existing appends a new row for the same run.
-    # Preserve only the latest successful result for each stable signature.
-    latest_by_signature: dict[str, dict[str, str]] = {}
-    rows_without_signature: list[dict[str, str]] = []
-    for row in successful_rows:
-        signature = row.get("run_signature", "").strip()
-        if signature:
-            latest_by_signature[signature] = row
-        else:
-            rows_without_signature.append(row)
-
-    for row in [*rows_without_signature, *latest_by_signature.values()]:
-        key = tuple(row[field] for field in SUMMARY_GROUP_FIELDS)
-        groups.setdefault(key, []).append(row)
-
-    summary_csv.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = summary_csv.with_suffix(f"{summary_csv.suffix}.tmp")
+    temporary_path = csv_path.with_name(f".{csv_path.name}.tmp")
+    header = csv_header()
     with temporary_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=summary_header())
+        writer = csv.DictWriter(handle, fieldnames=header)
         writer.writeheader()
-        for key in sorted(groups):
-            rows = groups[key]
-            summary_row: dict[str, str | int | float] = dict(
-                zip(SUMMARY_GROUP_FIELDS, key, strict=True)
-            )
-            summary_row["num_runs"] = len(rows)
-            for output_name, raw_name in SUMMARY_METRICS:
-                try:
-                    values = [float(row[raw_name]) for row in rows]
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise ValueError(
-                        f"Invalid {raw_name!r} value in successful rows of {results_csv}"
-                    ) from exc
-                mean, sample_std = _mean_and_sample_std(values)
-                summary_row[f"{output_name}_mean"] = mean
-                summary_row[f"{output_name}_std"] = sample_std
-            writer.writerow(summary_row)
-    temporary_path.replace(summary_csv)
+        writer.writerow({key: row.get(key, "") for key in header})
+    os.replace(temporary_path, csv_path)
 
 
 def run_one(
     dataset_name,
     method,
-    depth,
-    model_dim,
-    token_dim,
-    channel_dim,
     patch_size,
     train_loader,
     validation_loader,
@@ -1842,27 +1607,28 @@ def run_one(
         num_classes=metadata["num_classes"],
         image_size=metadata["image_size"],
         patch_size=patch_size,
-        model_dim=model_dim,
-        depth=depth,
-        token_hidden_dim=token_dim,
-        channel_hidden_dim=channel_dim,
+        model_dim=PAPER_DIM,
+        depth=PAPER_DEPTH,
+        token_hidden_dim=PAPER_TOKEN_DIM,
+        channel_hidden_dim=PAPER_CHANNEL_DIM,
         dropout=MIXER_DROPOUT,
     )
     if method == "bp":
         model = BackpropMixer(**model_kwargs).to(device)
-        optimizer = build_optimizer(
-            args.optimizer,
-            model.parameters(),
-            args.lr,
-            args.weight_decay,
-            args.momentum,
-        )
+        optimizer = build_optimizer(model.parameters())
         scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
         scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-    else:
+    elif method == "local-bp":
         model = LocalBPMixer(**model_kwargs).to(device)
         optimizers, schedulers = build_local_bp_optimizers(model, args)
         scalers = build_local_bp_scalers(model.depth, amp_enabled)
+    elif method == "ce-matched-ge":
+        model = LocalBPMixer(**model_kwargs).to(device)
+        optimizer = build_optimizer(model.parameters())
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    else:  # pragma: no cover - guarded by CLI choices
+        raise ValueError(f"Unsupported method: {method}")
     parameter_count = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
     )
@@ -1893,7 +1659,7 @@ def run_one(
                 metadata,
             )
             scheduler.step()
-        else:
+        elif method == "local-bp":
             current_lr = float(optimizers[0].param_groups[0]["lr"])
             train_loss, train_primary, train_secondary = train_local_bp(
                 model,
@@ -1901,12 +1667,24 @@ def run_one(
                 optimizers,
                 scalers,
                 device,
-                args.local_bp_updates_per_block,
+                PAPER_LOCAL_UPDATES,
                 amp_enabled,
                 metadata,
             )
             for local_scheduler in schedulers:
                 local_scheduler.step()
+        else:
+            current_lr = float(optimizer.param_groups[0]["lr"])
+            train_loss, train_primary, train_secondary = train_global_multihead_ce(
+                model,
+                train_loader,
+                optimizer,
+                scaler,
+                device,
+                amp_enabled,
+                metadata,
+            )
+            scheduler.step()
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             peak_memory_bytes = max(
@@ -1937,7 +1715,7 @@ def run_one(
         if not all(np.isfinite(value) for value in epoch_metrics):
             raise FloatingPointError(f"Non-finite epoch metrics at epoch {epoch}")
         improved = validation_primary > (
-            best_validation_primary + args.early_stop_min_delta
+            best_validation_primary + PAPER_EARLY_STOP_MIN_DELTA
         )
         if improved:
             best_epoch = epoch
@@ -1945,7 +1723,8 @@ def run_one(
             best_validation_secondary = validation_secondary
             best_validation_loss = validation_loss
             best_state = {
-                name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()
+                name: tensor.detach().cpu().clone()
+                for name, tensor in model.state_dict().items()
             }
             epochs_without_improvement = 0
         else:
@@ -1969,7 +1748,7 @@ def run_one(
         metric_primary = metadata["metric_primary_name"]
         metric_secondary = metadata["metric_secondary_name"]
         print(
-            f"[{dataset_name}|{method}|d={depth}|dim={model_dim}] "
+            f"[{dataset_name}|{method}|d={PAPER_DEPTH}|dim={PAPER_DIM}] "
             f"Epoch {epoch:03d}/{args.epochs} | LR {current_lr:.6e} | "
             f"Train loss {train_loss:.4f} "
             f"{metric_primary} {train_primary * 100:.2f}% "
@@ -1979,6 +1758,23 @@ def run_one(
             f"{metric_secondary} {validation_secondary * 100:.2f}%",
             flush=True,
         )
+        if args.heartbeat_file:
+            atomic_json(
+                Path(args.heartbeat_file).expanduser().resolve(),
+                {
+                    "status": "running",
+                    "dataset": dataset_name,
+                    "method": method,
+                    "depth": PAPER_DEPTH,
+                    "dim": PAPER_DIM,
+                    "seed": run_seed,
+                    "epoch": epoch,
+                    "epochs_target": args.epochs,
+                    "best_epoch": best_epoch,
+                    "best_validation_primary": best_validation_primary,
+                    "updated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                },
+            )
         if epochs_without_improvement >= args.early_stop_patience:
             stopped_for_patience = True
             print(
@@ -2016,7 +1812,7 @@ def run_one(
         checkpoint_root
         / dataset_name
         / method
-        / f"d{depth}_w{model_dim}"
+        / f"d{PAPER_DEPTH}_w{PAPER_DIM}"
         / f"seed_{run_seed}_{artifact_key[:16]}.pt"
     ).resolve()
     checkpoint_payload: dict[str, object] = {
@@ -2035,12 +1831,16 @@ def run_one(
         reloaded_checkpoint["state_dict"], best_state
     )
     if not checkpoint_reload_verified:
-        raise RuntimeError("Serialized checkpoint does not match the restored best state")
+        raise RuntimeError(
+            "Serialized checkpoint does not match the restored best state"
+        )
     checkpoint_path = str(checkpoint)
     test_evaluations = 0
     test_evaluations += 1
     if method == "bp":
-        test_loss, test_primary, test_secondary = eval_bp(model, test_loader, device, metadata)
+        test_loss, test_primary, test_secondary = eval_bp(
+            model, test_loader, device, metadata
+        )
     else:
         test_loss, test_primary, test_secondary = eval_local_bp(
             model, test_loader, device, metadata
@@ -2061,18 +1861,18 @@ def run_one(
 
     return {
         "result_schema_version": RESULT_SCHEMA_VERSION,
-        "suite_source_sha256": source_sha256()["MLPMixerBenchmarkSuite.py"],
-        "support_source_sha256": source_sha256()["medmnist_support.py"],
+        "suite_source_sha256": source_sha256()["mixer_experiment.py"],
+        "support_source_sha256": source_sha256()["pathmnist_data.py"],
         "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "status": "ok",
         "error": "",
         "run_signature": signature,
         "dataset": dataset_name,
         "method": method,
-        "depth": depth,
-        "dim": model_dim,
-        "token_dim": token_dim,
-        "channel_dim": channel_dim,
+        "depth": PAPER_DEPTH,
+        "dim": PAPER_DIM,
+        "token_dim": PAPER_TOKEN_DIM,
+        "channel_dim": PAPER_CHANNEL_DIM,
         "patch_size": patch_size,
         "num_classes": metadata["num_classes"],
         "in_channels": metadata["in_channels"],
@@ -2087,8 +1887,8 @@ def run_one(
         "seed": run_seed,
         "epochs_target": args.epochs,
         "early_stop_patience": args.early_stop_patience,
-        "early_stop_min_delta": args.early_stop_min_delta,
-        "validation_fraction": args.validation_fraction,
+        "early_stop_min_delta": PAPER_EARLY_STOP_MIN_DELTA,
+        "validation_fraction": PAPER_VALIDATION_FRACTION,
         "validation_is_official": int(metadata["validation_is_official"]),
         "dropout": MIXER_DROPOUT,
         "scheduler": SCHEDULER_NAME,
@@ -2096,12 +1896,12 @@ def run_one(
         "epochs_ran": epochs_ran,
         "early_stopped": int(stopped_for_patience),
         "local_bp_updates_per_block": (
-            args.local_bp_updates_per_block if method == "local-bp" else 0
+            PAPER_LOCAL_UPDATES if method == "local-bp" else 0
         ),
-        "optimizer": args.optimizer,
-        "lr": args.lr,
-        "weight_decay": args.weight_decay,
-        "momentum": args.momentum,
+        "optimizer": "adamw",
+        "lr": PAPER_LEARNING_RATE,
+        "weight_decay": PAPER_WEIGHT_DECAY,
+        "momentum": PAPER_MOMENTUM_METADATA,
         "batch_size": args.batch_size,
         "eval_batch_size": args.eval_batch_size,
         **split_sizes,
@@ -2119,9 +1919,12 @@ def run_one(
         "last_train_loss": last_train_loss,
         "last_train_primary": last_train_primary,
         "last_train_secondary": last_train_secondary,
-        "peak_train_mem_gb": (peak_memory_bytes / (1024**3) if device.type == "cuda" else 0.0),
+        "peak_train_mem_gb": (
+            peak_memory_bytes / (1024**3) if device.type == "cuda" else 0.0
+        ),
         "runtime_seconds": runtime_seconds,
         "num_params": parameter_count,
+        "terminal_classifier_bias": False if method == "bp" else None,
         "checkpoint_path": checkpoint_path,
         "checkpoint_sha256": checkpoint_sha256,
         "history_path": str(history_file),
@@ -2146,6 +1949,7 @@ def run_one(
                 "environment": environment,
                 "dataset_integrity": metadata.get("dataset_integrity", {}),
                 "selection": "validation_primary_strict_improvement",
+                "terminal_classifier_bias": False if method == "bp" else None,
                 "test_evaluated_once_after_best_checkpoint_restore": True,
             },
             sort_keys=True,
@@ -2158,227 +1962,125 @@ def main(argv: list[str] | None = None) -> int:
     for field_name in ("epochs", "batch_size", "eval_batch_size"):
         if getattr(args, field_name) <= 0:
             raise ValueError(f"--{field_name.replace('_', '-')} must be positive")
-    if not args.depths or any(value <= 0 for value in args.depths):
-        raise ValueError("--depths must contain positive integers")
-    if not args.dims or any(value <= 0 for value in args.dims):
-        raise ValueError("--dims must contain positive integers")
-    if args.token_dim < 0 or args.channel_dim < 0 or args.patch_size < 0:
-        raise ValueError("explicit token, channel, and patch dimensions cannot be negative")
-    if args.token_ratio <= 0 or args.channel_ratio <= 0:
-        raise ValueError("--token-ratio and --channel-ratio must be positive")
     if args.num_workers < 0:
         raise ValueError("--num-workers cannot be negative")
-    if args.lr <= 0 or args.weight_decay < 0 or args.momentum < 0:
-        raise ValueError("optimizer settings must be nonnegative and --lr must be positive")
-    if args.local_bp_updates_per_block <= 0:
-        raise ValueError("--local-bp-updates-per-block must be > 0")
     if args.early_stop_patience <= 0:
         raise ValueError("--early-stop-patience must be > 0")
-    if args.early_stop_min_delta < 0:
-        raise ValueError("--early-stop-min-delta cannot be negative")
-    if not 0 < args.validation_fraction < 1:
-        raise ValueError("--validation-fraction must lie strictly between 0 and 1")
-    matched_seeds = resolve_seeds(args)
+    if args.seed < 0:
+        raise ValueError("--seed cannot be negative")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA was requested but is not available")
-    set_seed(matched_seeds[0])
+    set_seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    results_path = output_dir / args.results_csv
-    summary_path = output_dir / args.summary_csv
-    if results_path.resolve() == summary_path.resolve():
-        raise ValueError("--results-csv and --summary-csv must name different files")
-    completed_signatures = load_done(results_path) if args.skip_existing else set()
+    results_path = output_dir / "result.csv"
     data_root = Path(args.data_dir)
-    run_index = 0
-    failures: list[str] = []
-
     print(f"CSV output: {results_path}", flush=True)
-    for dataset_name in args.datasets:
-        print(f"\nPreparing dataset: {dataset_name}", flush=True)
-        try:
-            train_set, validation_set, test_set, metadata = build_dataset(
-                dataset_name, data_root, args
-            )
-            dataset_integrity = metadata.get("dataset_integrity", {})
-            validate_dataset_integrity_record(dataset_name, dataset_integrity)
-            if dataset_integrity:
-                atomic_json(
-                    output_dir / "dataset_provenance" / f"{dataset_name}.json",
-                    {
-                        "dataset": dataset_name,
-                        "recorded_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        "integrity": dataset_integrity,
-                    },
-                )
-            patch_size = args.patch_size if args.patch_size > 0 else metadata["patch_default"]
-            if metadata["image_size"] % patch_size != 0:
-                raise ValueError(
-                    f"{dataset_name}: image_size {metadata['image_size']} "
-                    f"not divisible by patch {patch_size}"
-                )
-        except Exception as exc:
-            failures.append(f"{dataset_name}: {exc!r}")
-            print(f"FAILED to set up {dataset_name}: {exc!r}", flush=True)
-            append_row(
-                results_path,
+    metadata: dict[str, object] = {}
+    signature = ""
+    try:
+        train_set, validation_set, test_set, metadata = build_dataset(
+            args.dataset, data_root, args
+        )
+        dataset_integrity = metadata.get("dataset_integrity", {})
+        validate_dataset_integrity_record(args.dataset, dataset_integrity)
+        if dataset_integrity:
+            atomic_json(
+                output_dir / "dataset_provenance" / f"{args.dataset}.json",
                 {
-                    "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-                    "status": "failed",
-                    "error": repr(exc),
-                    "dataset": dataset_name,
-                    "notes_json": json.dumps({"run": "dataset setup failed"}),
+                    "dataset": args.dataset,
+                    "recorded_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "integrity": dataset_integrity,
                 },
             )
-            continue
-        for depth in args.depths:
-            for model_dim in args.dims:
-                token_dim = (
-                    args.token_dim
-                    if args.token_dim > 0
-                    else int(round(model_dim * args.token_ratio))
-                )
-                channel_dim = (
-                    args.channel_dim
-                    if args.channel_dim > 0
-                    else int(round(model_dim * args.channel_ratio))
-                )
-                for seed in matched_seeds:
-                    for method in args.methods:
-                        run_index += 1
-                        signature = run_signature(
-                            dataset_name,
-                            method,
-                            depth,
-                            model_dim,
-                            token_dim,
-                            channel_dim,
-                            patch_size,
-                            seed,
-                            args,
-                            dataset_integrity,
-                        )
-                        if signature in completed_signatures:
-                            print(
-                                f"Skip existing: {dataset_name}/{method}/"
-                                f"d{depth}/w{model_dim}/seed{seed}",
-                                flush=True,
-                            )
-                            continue
-                        print(
-                            f"\nRun {run_index}: dataset={dataset_name} method={method} "
-                            f"depth={depth} dim={model_dim} token_dim={token_dim} "
-                            f"channel_dim={channel_dim} patch={patch_size} seed={seed}",
-                            flush=True,
-                        )
-                        try:
-                            (
-                                train_loader,
-                                validation_loader,
-                                test_loader,
-                                split_sizes,
-                            ) = make_loaders(
-                                train_set,
-                                validation_set,
-                                test_set,
-                                metadata,
-                                args,
-                                seed,
-                            )
-                            result_row = run_one(
-                                dataset_name,
-                                method,
-                                depth,
-                                model_dim,
-                                token_dim,
-                                channel_dim,
-                                patch_size,
-                                train_loader,
-                                validation_loader,
-                                test_loader,
-                                split_sizes,
-                                metadata,
-                                args,
-                                seed,
-                                signature,
-                            )
-                            append_row(results_path, result_row)
-                            completed_signatures.add(signature)
-                            print(
-                                f"Done: test_{result_row['metric_primary_name']}="
-                                f"{result_row['test_primary'] * 100:.2f}% "
-                                f"test_{result_row['metric_secondary_name']}="
-                                f"{result_row['test_secondary'] * 100:.2f}% "
-                                f"| peak_mem={result_row['peak_train_mem_gb']:.2f}GB",
-                                flush=True,
-                            )
-                        except Exception as exc:
-                            failures.append(
-                                f"{dataset_name}/{method}/d{depth}/w{model_dim}/seed{seed}: {exc!r}"
-                            )
-                            print(f"FAILED: {repr(exc)}", flush=True)
-                            append_row(
-                                results_path,
-                                {
-                                    "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(
-                                        timespec="seconds"
-                                    ),
-                                    "status": "failed",
-                                    "error": repr(exc),
-                                    "run_signature": signature,
-                                    "dataset": dataset_name,
-                                    "method": method,
-                                    "depth": depth,
-                                    "dim": model_dim,
-                                    "token_dim": token_dim,
-                                    "channel_dim": channel_dim,
-                                    "patch_size": patch_size,
-                                    "num_classes": metadata["num_classes"],
-                                    "in_channels": metadata["in_channels"],
-                                    "image_size": metadata["image_size"],
-                                    "task": metadata["task"],
-                                    "metric_primary_name": metadata["metric_primary_name"],
-                                    "metric_secondary_name": metadata["metric_secondary_name"],
-                                    "seed": seed,
-                                    "epochs_target": args.epochs,
-                                    "early_stop_patience": args.early_stop_patience,
-                                    "early_stop_min_delta": args.early_stop_min_delta,
-                                    "validation_fraction": args.validation_fraction,
-                                    "validation_is_official": int(
-                                        metadata["validation_is_official"]
-                                    ),
-                                    "epochs_ran": 0,
-                                    "early_stopped": 0,
-                                    "local_bp_updates_per_block": (
-                                        args.local_bp_updates_per_block
-                                        if method == "local-bp"
-                                        else 0
-                                    ),
-                                    "optimizer": args.optimizer,
-                                    "lr": args.lr,
-                                    "weight_decay": args.weight_decay,
-                                    "momentum": args.momentum,
-                                    "batch_size": args.batch_size,
-                                    "eval_batch_size": args.eval_batch_size,
-                                    "train_samples": 0,
-                                    "validation_samples": 0,
-                                    "test_samples": len(test_set),
-                                    "num_workers": args.num_workers,
-                                    "device": str(device),
-                                    "amp_enabled": int(
-                                        device.type == "cuda" and not args.disable_amp
-                                    ),
-                                    "test_evaluations": 0,
-                                    "notes_json": json.dumps({"run": "failed"}),
-                                },
-                            )
-    write_summary(results_path, summary_path)
-    print(f"Summary output: {summary_path}", flush=True)
-    if failures:
-        print(f"Finished with {len(failures)} failed run(s).", flush=True)
+        patch_size = PAPER_PATCH_SIZES[args.dataset]
+        if metadata["patch_default"] != patch_size:
+            raise ValueError(f"Unexpected paper patch size for {args.dataset}")
+        signature = run_signature(
+            args.dataset,
+            args.method,
+            args.seed,
+            args,
+            dataset_integrity,
+        )
+        print(
+            f"Running dataset={args.dataset} method={args.method} seed={args.seed} "
+            f"D{PAPER_DEPTH}-W{PAPER_DIM} patch={patch_size}",
+            flush=True,
+        )
+        train_loader, validation_loader, test_loader, split_sizes = make_loaders(
+            train_set,
+            validation_set,
+            test_set,
+            metadata,
+            args,
+            args.seed,
+        )
+        result_row = run_one(
+            args.dataset,
+            args.method,
+            patch_size,
+            train_loader,
+            validation_loader,
+            test_loader,
+            split_sizes,
+            metadata,
+            args,
+            args.seed,
+            signature,
+        )
+        write_result(results_path, result_row)
+        print(
+            f"Done: test_{result_row['metric_primary_name']}="
+            f"{result_row['test_primary'] * 100:.2f}% "
+            f"test_{result_row['metric_secondary_name']}="
+            f"{result_row['test_secondary'] * 100:.2f}% "
+            f"| peak_mem={result_row['peak_train_mem_gb']:.2f}GB",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"FAILED: {exc!r}", flush=True)
+        write_result(
+            results_path,
+            {
+                "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+                "status": "failed",
+                "error": repr(exc),
+                "run_signature": signature,
+                "dataset": args.dataset,
+                "method": args.method,
+                "depth": PAPER_DEPTH,
+                "dim": PAPER_DIM,
+                "token_dim": PAPER_TOKEN_DIM,
+                "channel_dim": PAPER_CHANNEL_DIM,
+                "patch_size": PAPER_PATCH_SIZES[args.dataset],
+                "seed": args.seed,
+                "epochs_target": args.epochs,
+                "early_stop_patience": args.early_stop_patience,
+                "early_stop_min_delta": PAPER_EARLY_STOP_MIN_DELTA,
+                "validation_fraction": PAPER_VALIDATION_FRACTION,
+                "epochs_ran": 0,
+                "early_stopped": 0,
+                "local_bp_updates_per_block": (
+                    PAPER_LOCAL_UPDATES if args.method == "local-bp" else 0
+                ),
+                "optimizer": "adamw",
+                "lr": PAPER_LEARNING_RATE,
+                "weight_decay": PAPER_WEIGHT_DECAY,
+                "momentum": PAPER_MOMENTUM_METADATA,
+                "batch_size": args.batch_size,
+                "eval_batch_size": args.eval_batch_size,
+                "num_workers": args.num_workers,
+                "device": str(device),
+                "amp_enabled": int(device.type == "cuda" and not args.disable_amp),
+                "test_evaluations": 0,
+                "notes_json": json.dumps({"run": "failed"}),
+            },
+        )
         return 1
-    print("All runs finished.", flush=True)
     return 0
 
 
